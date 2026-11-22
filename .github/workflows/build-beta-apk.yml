@@ -1,0 +1,3249 @@
+require "import"
+import "com.androlua.Http"
+import "cjson"
+import "com.androlua.LuaDialog"
+import "android.widget.*"
+import "android.view.*"
+import "android.app.Dialog"
+import "android.app.ProgressDialog"
+import "android.app.AlertDialog"
+import "android.text.InputType"
+import "android.content.Context"
+import "android.content.Intent"
+import "android.content.ContentValues"
+import "android.content.DialogInterface"
+import "android.content.ClipboardManager"
+import "android.content.ClipData"
+import "android.net.Uri"
+import "android.net.ConnectivityManager"
+import "android.media.MediaPlayer"
+import "android.media.PlaybackParams"
+import "android.provider.MediaStore"
+import "android.util.Base64"
+import "android.os.*"
+import "android.graphics.Typeface"
+import "android.graphics.Color"
+import "java.io.*"
+import "java.net.URLEncoder"
+import "java.lang.String"
+import "java.lang.Math"
+import "java.util.HashMap"
+
+local context = activity
+local mainHandler = Handler(Looper.getMainLooper())
+
+local PREFS_NAME = "Google_Gemini_TTS_Prefs"
+local prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+function checkAndRequestPermissionsOnce()
+    if Build.VERSION.SDK_INT >= 23 then
+        local hasAsked = prefs.getBoolean("has_asked_permission", false)
+        if not hasAsked then
+            local permsToAsk = {}
+            if Build.VERSION.SDK_INT >= 33 then
+                if activity.checkSelfPermission("android.permission.READ_MEDIA_AUDIO") ~= 0 then
+                    table.insert(permsToAsk, "android.permission.READ_MEDIA_AUDIO")
+                end
+            else
+                if activity.checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE") ~= 0 then
+                    table.insert(permsToAsk, "android.permission.WRITE_EXTERNAL_STORAGE")
+                end
+                if activity.checkSelfPermission("android.permission.READ_EXTERNAL_STORAGE") ~= 0 then
+                    table.insert(permsToAsk, "android.permission.READ_EXTERNAL_STORAGE")
+                end
+            end
+            if #permsToAsk > 0 then
+                pcall(function()
+                    activity.requestPermissions(permsToAsk, 1)
+                end)
+            end
+            local ed = prefs.edit()
+            ed.putBoolean("has_asked_permission", true)
+            ed.apply()
+        end
+    end
+end
+
+checkAndRequestPermissionsOnce()
+
+local wakeLock = nil
+pcall(function()
+    local powerManager = context.getSystemService(Context.POWER_SERVICE)
+    wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "GeminiTTS:WakeLock")
+end)
+
+pcall(function()
+    Http.setConnTimeout(300000)
+    Http.setReadTimeout(300000)
+end)
+
+local ALL_VOICES = {
+    "Puck (Male)", "Kore (Female)", "Charon (Male)", "Zephyr (Female)", "Fenrir (Male)", "Leda (Female)",
+    "Orus (Male)", "Aoede (Female)", "Callirrhoe (Female)", "Autonoe (Female)", "Enceladus (Male)", "Iapetus (Male)",
+    "Umbriel (Male)", "Algieba (Male)", "Despina (Female)", "Erinome (Female)", "Algenib (Male)", "Rasalgethi (Male)",
+    "Laomedeia (Female)", "Achernar (Female)", "Alnilam (Male)", "Schedar (Male)", "Gacrux (Female)", "Pulcherrima (Female)",
+    "Achird (Male)", "Zubenelgenubi (Male)", "Vindemiatrix (Female)", "Sadachbia (Male)", "Sadaltager (Male)", "Sulafat (Female)"
+}
+
+local ALL_VOICES_LOWER = {}
+for _, v in ipairs(ALL_VOICES) do
+    local cleanName = v:match("^(%w+)")
+    if cleanName then
+        ALL_VOICES_LOWER[string.lower(cleanName)] = cleanName
+    end
+    ALL_VOICES_LOWER[string.lower(v)] = cleanName or v
+end
+
+local NARRATOR_VOICES = {"Orus (Male Narrator)", "Aoede (Female Narrator)"}
+
+local MALE_VOICES = {
+    "Puck", "Charon", "Fenrir", "Enceladus", "Iapetus", "Umbriel", "Algieba",
+    "Algenib", "Rasalgethi", "Alnilam", "Schedar", "Achird", "Zubenelgenubi", "Sadachbia", "Sadaltager"
+}
+
+local FEMALE_VOICES = {
+    "Kore", "Zephyr", "Leda", "Callirrhoe", "Autonoe", "Despina", "Erinome",
+    "Laomedeia", "Achernar", "Gacrux", "Pulcherrima", "Vindemiatrix", "Sulafat"
+}
+
+local FEMALE_MAPPING = {
+    ["female 1"] = "Kore", ["female 2"] = "Zephyr", ["female 3"] = "Leda", ["female 4"] = "Callirrhoe",
+    ["female 5"] = "Autonoe", ["female 6"] = "Despina", ["female 7"] = "Erinome", ["female 8"] = "Laomedeia",
+    ["female 9"] = "Achernar", ["female 10"] = "Gacrux", ["female 11"] = "Pulcherrima", ["female 12"] = "Vindemiatrix",
+    ["female 13"] = "Sulafat", ["female 14"] = "Kore"
+}
+
+local MALE_MAPPING = {
+    ["male 1"] = "Puck", ["male 2"] = "Charon", ["male 3"] = "Fenrir", ["male 4"] = "Enceladus",
+    ["male 5"] = "Iapetus", ["male 6"] = "Umbriel", ["male 7"] = "Algieba", ["male 8"] = "Algenib",
+    ["male 9"] = "Rasalgethi", ["male 10"] = "Alnilam", ["male 11"] = "Schedar", ["male 12"] = "Achird",
+    ["male 13"] = "Zubenelgenubi", ["male 14"] = "Sadachbia", ["male 15"] = "Sadaltager"
+}
+
+local ALL_TONES = {
+    "Default",
+    "Storytelling - Kahani",
+    "Conversational - Guftagu",
+    "Documentary - Rawi",
+    "Dramatic - Filmi",
+    "Emotional - Jazbati",
+    "Serious - Sanjeeda",
+    "Suspenseful - Sansani",
+    "Calming - Sukoon",
+    "Warm - Mohabbat",
+    "Friendly - Dostana",
+    "Casual - Aam",
+    "Energetic - Joshila",
+    "Excited - Josh",
+    "Cheerful - Khush",
+    "Hopeful - Umeed",
+    "Sad - Udaas",
+    "Angry - Ghussa",
+    "Romantic - Ashiqana",
+    "Funny - Mazahiya",
+    "Funny Jokes",
+    "Islamic / Spiritual",
+    "Islamic Bayan / Waqia",
+    "Tilawat / Quranic Reflection",
+    "Informative / Educational",
+    "News / Breaking",
+    "Debate / Discussion",
+    "Horror / Mystery",
+    "Poetry / Shayari",
+    "Kids / Cartoon Fun",
+    "Interview / Talk Show",
+    "Mysterious - Purisrar",
+    "Scary - Khaufnak",
+    "Whispering - Sargoshi",
+    "Motivational - Himmat",
+    "Inspirational - Hosla",
+    "Confident - PurAitemad",
+    "Authoritative - Hukam",
+    "Powerful - Taqatwar",
+    "Heroic - Bahadur",
+    "Villainous - Shaitani",
+    "Epic - Shandaar",
+    "Announcer - Ailaan",
+    "Deep - Gehra",
+    "Husky - Bhari",
+    "Smooth - Narm",
+    "Soothing - AramDeh",
+    "DilKash - DilKash",
+    "Engaging - Dilchasp",
+    "Charismatic - Kashish",
+    "Trustworthy - Bharosa",
+    "Corporate - Karobari",
+    "Sophisticated - Saleeqa",
+    "Luxurious - Shaahi",
+    "Bold - Diler",
+    "Aggressive - HamlaAawar",
+    "Urgent - Jaldi",
+    "Sarcastic - Tanza",
+    "Playful - Shararti",
+    "Cute - Pyara",
+    "Youthful - Jawaan",
+    "Childlike - Bachgana",
+    "Elderly - Buzurg",
+    "Gritty - Khurdura",
+    "Raspy - Phati",
+    "Awkward - Jhemp"
+}
+
+local BROADCAST_MOODS = {
+    "Funny Jokes",
+    "Funny / Comedy",
+    "Desi Comedy / Gup Shup",
+    "Sports Commentary / Match Review",
+    "Storytelling",
+    "Islamic / Spiritual",
+    "Islamic Bayan / Waqia",
+    "Tilawat / Quranic Reflection",
+    "Romantic",
+    "Sad / Emotional",
+    "Informative / Educational",
+    "News / Breaking",
+    "Motivational / Inspiring",
+    "Debate / Discussion",
+    "Horror / Mystery",
+    "Poetry / Shayari",
+    "Thriller / Suspense",
+    "Sarcastic / Roast",
+    "Documentary / Deep Dive",
+    "Kids / Cartoon Fun",
+    "Interview / Talk Show",
+    "True Crime / Investigation",
+    "History / Biography",
+    "Science & Tech Talk",
+    "Health & Fitness Guide",
+    "Business & Finance Talk",
+    "Politics & Current Affairs",
+    "Travel & Culture Show",
+    "Movie & Drama Review",
+    "Family & Relationship Advice",
+    "Morning Radio Show",
+    "Late Night Deep Talk",
+    "Cooking & Food Show",
+    "Q&A / Live Listener Show",
+    "Paranormal & Unexplained"
+}
+
+local SPEAKER_COUNTS = {"2 Speakers", "3 Speakers", "4 Speakers", "5 Speakers", "6 Speakers"}
+local SCRIPT_DURATIONS = {"1 Minute", "5 Minutes", "10 Minutes", "15 Minutes", "1 Hour (60 Minutes)", "Custom Minutes"}
+
+local TTS_MODELS = {"gemini-2.5-flash-preview-tts", "gemini-3.1-flash-tts-preview"}
+local TEXT_MODELS = {"gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"}
+local MAX_TOTAL_CHARS = 70000
+local MIN_CHUNK_SIZE = 1000
+local MAX_CHUNK_SIZE = 1500
+local MAX_BATCH_CHARS = 1800
+local DELAY_BETWEEN_CHUNKS = 1500
+
+local selectedVoice = "Puck (Male)"
+local selectedTone = "Default"
+local selectedModel = TTS_MODELS[1]
+local selectedNarrator = NARRATOR_VOICES[1]
+local isStoryMode = false
+local isBroadcastMode = false
+local broadcastSpeakerCount = 2
+local broadcastVoices = {"Puck (Male)", "Kore (Female)", "Charon (Male)", "Zephyr (Female)", "Fenrir (Male)", "Leda (Female)"}
+local selectedBroadcastMood = BROADCAST_MOODS[1]
+local selectedDuration = "10 Minutes"
+local customMinutesStr = "10"
+
+local userText = ""
+local userFileName = ""
+local generatedAudioPath = nil
+local mainMediaPlayer = nil
+local isMainPlaying = false
+local fileCounter = 0
+
+local apiKeys = {"","","","","","","","","",""}
+local currentKeyIndex = 1
+local activeHttpRequest = nil
+local cancellationRequested = false
+local currentGenerationId = 0
+
+local assignedVoices = {}
+local usedVoices = {}
+local dynMaleIndex = 1
+local dynFemaleIndex = 1
+
+local resumeState = nil
+local errorLogs = {}
+local mainViewsRef = nil
+
+local libMediaPlayer = nil
+local isLibPlaying = false
+local currentPlayingBtn = nil
+local currentPlayingPath = nil
+local currentPlayingInfoTxt = nil
+local currentPlayingBaseInfo = nil
+local currentPlayingTotalSec = 0
+local libTimerActive = false
+local libTimerRunnable = nil
+
+function getSafeBaseDir()
+    local extDir = nil
+    pcall(function() extDir = context.getExternalFilesDir(nil) end)
+    if extDir ~= nil then
+        return extDir.getPath()
+    end
+    return context.getFilesDir().getPath()
+end
+
+function getLibraryDir()
+    local dir = File(getSafeBaseDir() .. "/AudioLibrary")
+    if not dir.exists() then dir.mkdirs() end
+    return dir
+end
+
+function runOnUi(callback) mainHandler.post(Runnable({ run = callback })) end
+function delay(ms, callback) Handler(Looper.getMainLooper()).postDelayed(Runnable({ run = callback }), ms) end
+function showToast(msg) runOnUi(function() Toast.makeText(context, tostring(msg), Toast.LENGTH_SHORT).show() end) end
+function speak(t) showToast(t) end
+
+function isNetworkAvailable()
+    local connected = true
+    pcall(function()
+        local cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+        if cm then
+            local netInfo = cm.getActiveNetworkInfo()
+            connected = (netInfo ~= nil and netInfo.isConnected())
+        end
+    end)
+    return connected
+end
+
+function setKeepAwake(keepAwake)
+    pcall(function()
+        if wakeLock then
+            if keepAwake then
+                if not wakeLock.isHeld() then wakeLock.acquire() end
+            else
+                if wakeLock.isHeld() then wakeLock.release() end
+            end
+        end
+    end)
+end
+
+function encodeSecret(str)
+    if not str or str == "" then return "" end
+    local ok, res = pcall(function()
+        return Base64.encodeToString(String(str).getBytes("UTF-8"), Base64.NO_WRAP)
+    end)
+    return ok and ("ENC:" .. tostring(res)) or str
+end
+
+function decodeSecret(str)
+    if not str or str == "" then return "" end
+    if str:sub(1, 4) == "ENC:" then
+        local encoded = str:sub(5)
+        local ok, res = pcall(function()
+            local bytes = Base64.decode(encoded, Base64.NO_WRAP)
+            return tostring(String(bytes, "UTF-8"))
+        end)
+        if ok and res then return res end
+    end
+    return str
+end
+
+function sanitizeErrorText(errText)
+    local clean = tostring(errText or "Unknown Error")
+    for i = 1, 10 do
+        local k = apiKeys[i]
+        if k and #k > 5 then
+            clean = clean:gsub(k:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"), "[HIDDEN_KEY]")
+        end
+    end
+    return clean
+end
+
+function saveErrorLogs()
+    local editor = prefs.edit()
+    local ok, encoded = pcall(cjson.encode, errorLogs)
+    if ok and encoded then
+        editor.putString("error_logs", encoded)
+        editor.apply()
+    end
+end
+
+function loadErrorLogs()
+    local raw = prefs.getString("error_logs", "[]")
+    local ok, decoded = pcall(cjson.decode, raw)
+    if ok and type(decoded) == "table" then
+        errorLogs = decoded
+    else
+        errorLogs = {}
+    end
+end
+
+function logAppError(source, msg)
+    local cleanMsg = sanitizeErrorText(msg)
+    local entry = "[" .. os.date("%Y-%m-%d %H:%M:%S") .. "] [" .. tostring(source) .. "] " .. cleanMsg
+    table.insert(errorLogs, entry)
+    if #errorLogs > 50 then
+        table.remove(errorLogs, 1)
+    end
+    saveErrorLogs()
+end
+
+function writeTextFile(path, str)
+    local fos = nil
+    local ok = pcall(function()
+        fos = FileOutputStream(File(path))
+        fos.write(String(str).getBytes("UTF-8"))
+        fos.flush()
+    end)
+    pcall(function() if fos then fos.close() end end)
+    return ok
+end
+
+function readTextFile(path)
+    local f = File(path)
+    if not f.exists() then return nil end
+    local fis = nil
+    local ok, res = pcall(function()
+        fis = FileInputStream(f)
+        local len = f.length()
+        local buf = byte[len]
+        fis.read(buf)
+        return tostring(String(buf, "UTF-8"))
+    end)
+    pcall(function() if fis then fis.close() end end)
+    return ok and res or nil
+end
+
+function getResumeMetaPath(wavPath)
+    return wavPath .. ".resume.json"
+end
+
+function saveResumeMetaToDisk(stateObj)
+    if not stateObj or not stateObj.partialWavPath then return end
+    local ok, jsonStr = pcall(cjson.encode, stateObj)
+    if ok and jsonStr then
+        writeTextFile(getResumeMetaPath(stateObj.partialWavPath), jsonStr)
+    end
+end
+
+function loadResumeMetaFromDisk(wavPath)
+    local metaPath = getResumeMetaPath(wavPath)
+    local raw = readTextFile(metaPath)
+    if not raw then return nil end
+    local ok, obj = pcall(cjson.decode, raw)
+    if ok and type(obj) == "table" and obj.jobs and obj.nextIndex and obj.totalChunks then
+        obj.partialWavPath = wavPath
+        return obj
+    end
+    return nil
+end
+
+function deleteResumeMetaFromDisk(wavPath)
+    if not wavPath then return end
+    pcall(function() File(getResumeMetaPath(wavPath)).delete() end)
+end
+
+function findLatestResumeState()
+    local dir = getLibraryDir()
+    local files = dir.listFiles()
+    if not files then return nil end
+    local latestFile = nil
+    local latestTime = -1
+    local ok, tbl = pcall(function() return luajava.astable(files) end)
+    local list = (ok and tbl) or {}
+    if not ok then
+        for i = 0, #files - 1 do
+            pcall(function() if files[i] then table.insert(list, files[i]) end end)
+        end
+    end
+    for _, f in ipairs(list) do
+        if f and f.getName():match("%.wav$") then
+            local metaFile = File(getResumeMetaPath(f.getPath()))
+            if metaFile.exists() and f.lastModified() > latestTime then
+                latestTime = f.lastModified()
+                latestFile = f
+            end
+        end
+    end
+    if latestFile then
+        return loadResumeMetaFromDisk(latestFile.getPath())
+    end
+    return nil
+end
+
+function formatMMSS(totalSec)
+    local sec = math.max(0, math.floor(tonumber(totalSec) or 0))
+    return string.format("%02d:%02d", math.floor(sec / 60), sec % 60)
+end
+
+function formatDurationReadable(totalSec)
+    local sec = math.max(0, math.floor(tonumber(totalSec) or 0))
+    local m = math.floor(sec / 60)
+    local s = sec % 60
+    return string.format("%d min %d sec", m, s)
+end
+
+function getAudioDurationSec(filePath)
+    local f = File(filePath)
+    if not f.exists() then return 0 end
+    local len = f.length()
+    if len <= 44 then return 0 end
+    return math.max(0, math.floor((len - 44) / 48000))
+end
+
+function shareAudioFile(filePath)
+    local f = File(filePath or "")
+    if not f.exists() or f.length() <= 44 then
+        showToast("Audio file not found or empty")
+        return
+    end
+    local uri = nil
+    local authority = context.getPackageName()
+    local fpClasses = {
+        "android.content.FileProvider",
+        "androidx.core.content.FileProvider",
+        "android.support.v4.content.FileProvider"
+    }
+    for _, clsName in ipairs(fpClasses) do
+        local okCls, fpCls = pcall(luajava.bindClass, clsName)
+        if okCls and fpCls then
+            local okUri, resUri = pcall(function() return fpCls.getUriForFile(context, authority, f) end)
+            if okUri and resUri then
+                uri = resUri
+                break
+            end
+        end
+    end
+    if uri == nil then
+        pcall(function()
+            local sm = luajava.bindClass("android.os.StrictMode")
+            local builder = sm.VmPolicy.Builder()
+            sm.setVmPolicy(builder.build())
+            uri = Uri.fromFile(f)
+        end)
+    end
+    if uri == nil then
+        logAppError("SHARE", "Could not generate URI for sharing: " .. tostring(filePath))
+        showToast("Unable to share file on this device")
+        return
+    end
+    local okShare, errShare = pcall(function()
+        local intent = Intent(Intent.ACTION_SEND)
+        intent.setType("audio/wav")
+        intent.putExtra(Intent.EXTRA_STREAM, uri)
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        local chooser = Intent.createChooser(intent, "Share Audio")
+        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(chooser)
+    end)
+    if not okShare then
+        logAppError("SHARE", tostring(errShare))
+        showToast("Failed to open share menu")
+    end
+end
+
+function copyFile(sourcePath, destPath)
+    local inStream = nil
+    local outStream = nil
+    local success = pcall(function()
+        local outFile = File(destPath)
+        if not outFile.getParentFile().exists() then
+            outFile.getParentFile().mkdirs()
+        end
+        inStream = FileInputStream(File(sourcePath))
+        outStream = FileOutputStream(outFile)
+        local buffer = byte[8192]
+        while true do
+            local len = inStream.read(buffer)
+            if len == -1 then break end
+            outStream.write(buffer, 0, len)
+        end
+        outStream.flush()
+    end)
+    pcall(function() if inStream then inStream.close() end end)
+    pcall(function() if outStream then outStream.close() end end)
+    return success
+end
+
+function saveFileToDownloads(sourcePath, fileName)
+    local srcFile = File(sourcePath)
+    if not srcFile.exists() or srcFile.length() <= 44 then
+        return false, "Source audio file is empty or corrupt"
+    end
+
+    if Build.VERSION.SDK_INT >= 29 then
+        local okMedia, mediaSaved = pcall(function()
+            local resolver = context.getContentResolver()
+            local values = ContentValues()
+            values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            values.put(MediaStore.MediaColumns.MIME_TYPE, "audio/wav")
+            values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            local uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            if uri == nil then return false end
+            local inStream = FileInputStream(srcFile)
+            local outStream = resolver.openOutputStream(uri)
+            if outStream == nil then
+                inStream.close()
+                return false
+            end
+            local buffer = byte[8192]
+            while true do
+                local len = inStream.read(buffer)
+                if len == -1 then break end
+                outStream.write(buffer, 0, len)
+            end
+            outStream.flush()
+            inStream.close()
+            outStream.close()
+            return true
+        end)
+        if okMedia and mediaSaved then
+            return true, "Saved to Downloads"
+        end
+    end
+
+    local destPath = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).getPath() .. "/" .. fileName
+    local okCopy = copyFile(sourcePath, destPath)
+    if okCopy then
+        return true, "Saved to Downloads"
+    end
+    logAppError("DOWNLOAD", "Failed to save " .. tostring(fileName))
+    return false, "Storage permission denied or failed to write"
+end
+
+function createOverlayDialog(view)
+    local dialog = LuaDialog(activity)
+    dialog.setView(view)
+    return dialog
+end
+
+function showSuccessDialog(parentDialog, msgTextString)
+    local layout = LinearLayout(context)
+    layout.setOrientation(1)
+    layout.setPadding(60, 60, 60, 60)
+    layout.setGravity(Gravity.CENTER)
+    local msgText = TextView(context)
+    msgText.setText(msgTextString or "Action completed successfully!")
+    msgText.setTextSize(16)
+    msgText.setTextColor(0xFF4CAF50)
+    msgText.setGravity(Gravity.CENTER)
+    msgText.setPadding(0, 0, 0, 40)
+    layout.addView(msgText)
+    local btnOk = Button(context)
+    btnOk.setText("OK")
+    btnOk.setBackgroundColor(0xFF2196F3)
+    btnOk.setTextColor(0xFFFFFFFF)
+    layout.addView(btnOk)
+    local successDialog = createOverlayDialog(layout)
+    successDialog.show()
+    btnOk.setOnClickListener(function()
+        successDialog.dismiss()
+        if parentDialog then parentDialog.dismiss() end
+    end)
+end
+
+function showErrorDialog(errorMsg)
+    local layout = LinearLayout(context)
+    layout.setOrientation(1)
+    layout.setPadding(60, 60, 60, 60)
+    layout.setGravity(Gravity.CENTER)
+    local msgText = TextView(context)
+    msgText.setText("Error: " .. sanitizeErrorText(errorMsg))
+    msgText.setTextSize(16)
+    msgText.setTextColor(0xFFF44336)
+    msgText.setGravity(Gravity.CENTER)
+    msgText.setPadding(0, 0, 0, 40)
+    layout.addView(msgText)
+    local btnOk = Button(context)
+    btnOk.setText("CLOSE")
+    btnOk.setBackgroundColor(0xFF9E9E9E)
+    btnOk.setTextColor(0xFFFFFFFF)
+    layout.addView(btnOk)
+    local errDialog = createOverlayDialog(layout)
+    errDialog.show()
+    btnOk.setOnClickListener(function() errDialog.dismiss() end)
+end
+
+function openReportIssueDialog()
+    local scroll = ScrollView(context)
+    local layout = LinearLayout(context)
+    layout.setOrientation(1)
+    layout.setPadding(35, 35, 35, 35)
+
+    local title = TextView(context)
+    title.setText("Report Issue / Error Log")
+    title.setTextSize(18)
+    title.setGravity(Gravity.CENTER)
+    title.setTextColor(0xFFD32F2F)
+    title.setTypeface(Typeface.DEFAULT_BOLD)
+    title.setPadding(0, 0, 0, 20)
+    layout.addView(title)
+
+    local logView = TextView(context)
+    logView.setTextSize(12)
+    logView.setTextColor(0xFF222222)
+    logView.setBackgroundColor(0xFFF5F5F5)
+    logView.setPadding(20, 20, 20, 20)
+    local function getReportText()
+        if #errorLogs == 0 then
+            return "No errors or issues recorded yet. Everything is working smoothly."
+        end
+        return table.concat(errorLogs, "\n\n")
+    end
+    logView.setText(getReportText())
+    layout.addView(logView)
+
+    local function makeBtn(label, bgHex)
+        local b = Button(context)
+        b.setText(label)
+        b.setBackgroundColor(Color.parseColor(bgHex))
+        b.setTextColor(Color.WHITE)
+        local p = LinearLayout.LayoutParams(-1, -2)
+        p.topMargin = 12
+        b.setLayoutParams(p)
+        return b
+    end
+
+    local btnCopy = makeBtn("COPY REPORT", "#2196F3")
+    local btnWa = makeBtn("SEND ON WHATSAPP", "#25D366")
+    local btnClear = makeBtn("CLEAR LOG", "#FF9800")
+    local btnBack = makeBtn("GO BACK", "#9E9E9E")
+
+    layout.addView(btnCopy)
+    layout.addView(btnWa)
+    layout.addView(btnClear)
+    layout.addView(btnBack)
+
+    scroll.addView(layout)
+    local dlg = createOverlayDialog(scroll)
+    dlg.show()
+
+    btnCopy.setOnClickListener(function()
+        pcall(function()
+            local cm = context.getSystemService(Context.CLIPBOARD_SERVICE)
+            cm.setPrimaryClip(ClipData.newPlainText("ErrorReport", getReportText()))
+            showToast("Report copied to clipboard")
+        end)
+    end)
+
+    btnWa.setOnClickListener(function()
+        pcall(function()
+            local reportBody = "Google Gemini TTS Issue Report:\n" .. getReportText()
+            if #reportBody > 3000 then reportBody = reportBody:sub(#reportBody - 2999) end
+            local url = "https://wa.me/923041011727?text=" .. URLEncoder.encode(reportBody, "UTF-8")
+            local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        end)
+    end)
+
+    btnClear.setOnClickListener(function()
+        errorLogs = {}
+        saveErrorLogs()
+        logView.setText(getReportText())
+        showToast("Error logs cleared")
+    end)
+
+    btnBack.setOnClickListener(function() dlg.dismiss() end)
+end
+
+function openFeedbackDialog()
+    local scroll = ScrollView(context)
+    local layout = LinearLayout(context)
+    layout.setOrientation(1)
+    layout.setPadding(40, 40, 40, 40)
+    local title = TextView(context)
+    title.setText("Send Feedback to Developer")
+    title.setTextSize(20)
+    title.setGravity(Gravity.CENTER)
+    title.setTextColor(0xFF2196F3)
+    title.setPadding(0, 0, 0, 20)
+    title.setTypeface(Typeface.DEFAULT_BOLD)
+    layout.addView(title)
+    
+    local editAppName = EditText(context)
+    editAppName.setText("Google Gemini Text to Speech")
+    editAppName.setEnabled(false)
+    editAppName.setTextColor(0xFF888888)
+    layout.addView(editAppName)
+    
+    local editName = EditText(context)
+    editName.setHint("Enter Name")
+    editName.setContentDescription("Enter your name")
+    layout.addView(editName)
+    
+    local editWa = EditText(context)
+    editWa.setHint("WhatsApp Number (Optional)")
+    editWa.setContentDescription("Enter WhatsApp number optional")
+    editWa.setInputType(InputType.TYPE_CLASS_PHONE)
+    layout.addView(editWa)
+    
+    local editMsg = EditText(context)
+    editMsg.setHint("Enter Feedback Message")
+    editMsg.setContentDescription("Enter feedback message")
+    layout.addView(editMsg)
+    
+    local btnSend = Button(context)
+    btnSend.setText("SEND FEEDBACK")
+    btnSend.setBackgroundColor(0xFF2196F3)
+    btnSend.setTextColor(0xFFFFFFFF)
+    local pSend = LinearLayout.LayoutParams(-1, -2)
+    pSend.topMargin = 15
+    btnSend.setLayoutParams(pSend)
+    layout.addView(btnSend)
+    
+    local btnBack = Button(context)
+    btnBack.setText("GO BACK")
+    btnBack.setBackgroundColor(0xFFF44336)
+    btnBack.setTextColor(0xFFFFFFFF)
+    local pBack = LinearLayout.LayoutParams(-1, -2)
+    pBack.topMargin = 10
+    btnBack.setLayoutParams(pBack)
+    layout.addView(btnBack)
+    
+    scroll.addView(layout)
+    local fbDialog = createOverlayDialog(scroll)
+    fbDialog.show()
+    btnBack.setOnClickListener(function() fbDialog.dismiss() end)
+    
+    btnSend.setOnClickListener(function()
+        local name = tostring(editName.getText() or ""):match("^%s*(.-)%s*$")
+        local wa = tostring(editWa.getText() or ""):match("^%s*(.-)%s*$")
+        local msg = tostring(editMsg.getText() or "")
+        local trimmedMsg = msg:match("^%s*(.-)%s*$")
+        if trimmedMsg == "" then
+            speak("Please enter a valid feedback message")
+            return
+        end
+        if String(trimmedMsg).length() > 5000 then
+            speak("Feedback exceeds 5000 characters")
+            return
+        end
+        if not isNetworkAvailable() then
+            speak("No internet connection. Please connect to the internet.")
+            showErrorDialog("No internet connection available.")
+            return
+        end
+        local pd = ProgressDialog(context)
+        pd.setMessage("Sending please wait...")
+        pd.setCancelable(false)
+        pd.show()
+        speak("Sending please wait")
+        
+        local BOT_TOKEN = decodeSecret("ENC:ODc3OTk0NzI0MzpBQUVDM0hZcWw1S2JiSm5KWlRlN1lZQjJySVFLLXhvSmFiOA==")
+        local CHAT_ID = decodeSecret("ENC:NzM5MDk3MzQ2Ng==")
+        local VERCEL_URL = "https://send-feedback-dusky.vercel.app/api"
+        local formattedName = (name ~= "" and name or "Anonymous")
+        local fullText = "New Feedback Received:\nApp: Google Gemini Text to Speech\nName: " .. formattedName
+        if wa ~= "" then fullText = fullText .. "\nWhatsApp: " .. wa end
+        fullText = fullText .. "\nFeedback: " .. trimmedMsg
+        local encodedToken = URLEncoder.encode(BOT_TOKEN, "UTF-8")
+        local encodedChatId = URLEncoder.encode(CHAT_ID, "UTF-8")
+        local encodedText = URLEncoder.encode(fullText, "UTF-8")
+        local postData = "bot_token=" .. encodedToken .. "&chat_id=" .. encodedChatId .. "&text=" .. encodedText
+        Http.post(VERCEL_URL, postData, function(code, content)
+            runOnUi(function()
+                pcall(function() pd.dismiss() end)
+                if tonumber(code) == 200 then
+                    speak("Feedback sent successfully")
+                    editMsg.setText("")
+                    showSuccessDialog(fbDialog, "Feedback sent successfully!")
+                else
+                    local errCode = tostring(code or "Network Error")
+                    logAppError("FEEDBACK", "HTTP " .. errCode)
+                    speak("Failed to send feedback.")
+                    showErrorDialog("Failed to send feedback (Code: " .. errCode .. "). Please check your internet connection.")
+                end
+            end)
+        end)
+    end)
+end
+
+function matchVoiceDisplay(rawName, fallback)
+    local target = tostring(rawName or "")
+    local cleanTarget = target:match("^(%w+)") or target
+    for _, v in ipairs(ALL_VOICES) do
+        if v == target or v:match("^(%w+)") == cleanTarget then
+            return v
+        end
+    end
+    return fallback
+end
+
+function saveSettings()
+    local editor = prefs.edit()
+    editor.putString("voice", selectedVoice)
+    editor.putString("tone", selectedTone)
+    editor.putString("model", selectedModel)
+    editor.putString("narrator", selectedNarrator)
+    editor.putBoolean("storyMode", isStoryMode)
+    editor.putBoolean("broadcastMode", isBroadcastMode)
+    editor.putInt("broadcastSpeakerCount", broadcastSpeakerCount)
+    for i = 1, 6 do
+        editor.putString("broadcastVoice_" .. i, broadcastVoices[i])
+    end
+    editor.putString("broadcastMood", selectedBroadcastMood)
+    editor.putString("scriptDuration", selectedDuration)
+    editor.putString("customMinutes", customMinutesStr)
+    for i = 1, 10 do
+        local cleanKey = tostring(apiKeys[i] or ""):match("^%s*(.-)%s*$")
+        apiKeys[i] = cleanKey
+        editor.putString("apikey_" .. i, encodeSecret(cleanKey))
+    end
+    editor.putString("filename", userFileName)
+    editor.putInt("fileCounter", fileCounter)
+    editor.apply()
+end
+
+function loadSettings()
+    loadErrorLogs()
+    selectedVoice = matchVoiceDisplay(prefs.getString("voice", "Puck (Male)"), "Puck (Male)")
+
+    local savedTone = prefs.getString("tone", "Default")
+    local matchedTone = nil
+    for _, t in ipairs(ALL_TONES) do
+        if t == savedTone then matchedTone = t break end
+    end
+    selectedTone = matchedTone or "Default"
+
+    selectedModel = prefs.getString("model", TTS_MODELS[1])
+    selectedNarrator = prefs.getString("narrator", NARRATOR_VOICES[1])
+    isStoryMode = prefs.getBoolean("storyMode", false)
+    isBroadcastMode = prefs.getBoolean("broadcastMode", false)
+    if isStoryMode and isBroadcastMode then isBroadcastMode = false end
+
+    broadcastSpeakerCount = prefs.getInt("broadcastSpeakerCount", 2)
+    if broadcastSpeakerCount < 2 or broadcastSpeakerCount > 6 then broadcastSpeakerCount = 2 end
+    local defaultBVoices = {"Puck (Male)", "Kore (Female)", "Charon (Male)", "Zephyr (Female)", "Fenrir (Male)", "Leda (Female)"}
+    for i = 1, 6 do
+        broadcastVoices[i] = matchVoiceDisplay(prefs.getString("broadcastVoice_" .. i, defaultBVoices[i]), defaultBVoices[i])
+    end
+
+    local savedMood = prefs.getString("broadcastMood", BROADCAST_MOODS[1])
+    local matchedMood = nil
+    for _, m in ipairs(BROADCAST_MOODS) do
+        if m == savedMood then matchedMood = m break end
+    end
+    selectedBroadcastMood = matchedMood or BROADCAST_MOODS[1]
+
+    selectedDuration = prefs.getString("scriptDuration", "10 Minutes")
+    customMinutesStr = prefs.getString("customMinutes", "10")
+
+    for i = 1, 10 do
+        local rawKey = prefs.getString("apikey_" .. i, "")
+        apiKeys[i] = decodeSecret(rawKey):match("^%s*(.-)%s*$")
+    end
+    userFileName = prefs.getString("filename", "")
+    fileCounter = prefs.getInt("fileCounter", 0)
+end
+
+function getDefaultFileName(modeName)
+    fileCounter = fileCounter + 1
+    saveSettings()
+    local prefix = "Single"
+    if modeName == "broadcast" then
+        prefix = "Broadcast"
+    elseif modeName == "story" then
+        prefix = "Story"
+    end
+    return prefix .. "_Jahbaz_" .. string.format("%03d", fileCounter)
+end
+
+function initMainMediaPlayer()
+    if mainMediaPlayer ~= nil then
+        pcall(function() if isMainPlaying then mainMediaPlayer.stop() end end)
+        isMainPlaying = false
+        pcall(function() mainMediaPlayer.release() end)
+    end
+    mainMediaPlayer = MediaPlayer()
+end
+
+function toggleMainPlayPause(playBtn)
+    if mainMediaPlayer == nil then showToast("No audio loaded") return false end
+    if isMainPlaying then
+        pcall(function() mainMediaPlayer.pause() end)
+        isMainPlaying = false
+        runOnUi(function()
+            playBtn.setText("PLAY")
+            playBtn.setContentDescription("Play audio")
+        end)
+    else
+        local okStart = pcall(function() mainMediaPlayer.start() end)
+        if okStart then
+            isMainPlaying = true
+            runOnUi(function()
+                playBtn.setText("PAUSE")
+                playBtn.setContentDescription("Pause audio")
+            end)
+        end
+    end
+end
+
+function writeWavHeader(outStream, totalAudioLen)
+    local sampleRate, channels, bitsPerSample = 24000, 1, 16
+    local byteRate = sampleRate * channels * (bitsPerSample / 8)
+    local blockAlign = channels * (bitsPerSample / 8)
+    local totalSize = totalAudioLen + 36
+    local function getBytes(val) return {val & 0xff, (val >> 8) & 0xff, (val >> 16) & 0xff, (val >> 24) & 0xff} end
+    local totalSizeB, sampleRateB, byteRateB, dataLenB = getBytes(totalSize), getBytes(sampleRate), getBytes(byteRate), getBytes(totalAudioLen)
+    local header = {0x52, 0x49, 0x46, 0x46, totalSizeB[1], totalSizeB[2], totalSizeB[3], totalSizeB[4], 0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74, 0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, channels & 0xff, (channels >> 8) & 0xff, sampleRateB[1], sampleRateB[2], sampleRateB[3], sampleRateB[4], byteRateB[1], byteRateB[2], byteRateB[3], byteRateB[4], blockAlign & 0xff, (blockAlign >> 8) & 0xff, bitsPerSample & 0xff, (bitsPerSample >> 8) & 0xff, 0x64, 0x61, 0x74, 0x61, dataLenB[1], dataLenB[2], dataLenB[3], dataLenB[4]}
+    for i = 1, #header do outStream.write(header[i]) end
+end
+
+function writeSilenceSeconds(outStream, seconds)
+    local sec = tonumber(seconds) or 0
+    if sec <= 0 then return 0 end
+    if sec > 15 then sec = 15 end
+    local totalBytes = math.floor(sec * 24000 * 2)
+    if totalBytes % 2 ~= 0 then totalBytes = totalBytes + 1 end
+    local zeroBuf = byte[4800]
+    local remaining = totalBytes
+    while remaining > 0 do
+        local toWrite = math.min(remaining, 4800)
+        outStream.write(zeroBuf, 0, toWrite)
+        remaining = remaining - toWrite
+    end
+    return totalBytes
+end
+
+function getValidApiKeysList()
+    local valid = {}
+    for i = 1, 10 do
+        local k = apiKeys[i]
+        if k and k ~= "" then
+            table.insert(valid, {index = i, key = k})
+        end
+    end
+    return valid
+end
+
+function getWorkingApiKey()
+    for i = 1, 10 do
+        local idx = ((currentKeyIndex + i - 2) % 10) + 1
+        if apiKeys[idx] and apiKeys[idx] ~= "" then
+            currentKeyIndex = idx
+            return apiKeys[idx]
+        end
+    end
+    return nil
+end
+
+function rotateToNextWorkingApiKey()
+    for i = 1, 10 do
+        local idx = ((currentKeyIndex + i - 1) % 10) + 1
+        if apiKeys[idx] and apiKeys[idx] ~= "" then
+            currentKeyIndex = idx
+            return apiKeys[idx]
+        end
+    end
+    return nil
+end
+
+function cleanDialogueAndExtractPause(rawText)
+    if not rawText then return "", 0 end
+    local text = rawText
+    local extraPauseSec = 0
+
+    text = text:gsub("%[[pP][aA][uU][sS][eE]:%s*([%d%.]+)%s*([mM]?[sS]?)%s*%]", function(numStr, unit)
+        local val = tonumber(numStr) or 0
+        if string.lower(unit or "") == "ms" then
+            val = val / 1000
+        end
+        extraPauseSec = extraPauseSec + val
+        return " "
+    end)
+
+    text = text:gsub("%[[^%]]*%]", "")
+    text = text:gsub("</?speak>", ""):gsub("<break[^>]*>", " "):gsub("</?emphasis[^>]*>", "")
+    text = text:gsub("%*(.-)%*", "%1")
+    text = text:gsub("%s+", " "):match("^%s*(.-)%s*$") or ""
+
+    return text, extraPauseSec
+end
+
+function isFemaleUrduOrEnglishName(str)
+    local s = string.lower(str or "")
+    local femHints = {
+        "female", "woman", "girl", "lady", "mother", "sister", "aunt", "wife", "queen", "princess", "mrs", "miss", "madam",
+        "عورت", "فیمیل", "لڑکی", "آنٹی", "انٹی", "بیگم", "ماسی", "خاتون", "بیٹی", "بہن", "ماں", "امی", "دادی", "نانی",
+        "خالہ", "پھوپھی", "بیوی", "بھابھی", "دلہن", "ملکہ", "شہزادی", "آپا", "باجی", "بڑھیا", "نجمہ", "شمیم", "سرداراں",
+        "بشری", "جیران", "عائشہ", "فاطمہ", "زینب", "مریم", "سارہ", "حنا", "ثنا", "نادیہ", "صبا", "آمنہ", "رضیہ", "شازیہ"
+    }
+    for _, h in ipairs(femHints) do
+        if s:find(h, 1, true) then return true end
+    end
+    return false
+end
+
+function isRecognizedVoiceTag(rawTag)
+    local s = string.lower(rawTag or "")
+    if s:find("male") or s:find("female") or s:find("narrator") or s:find("voice") or s:find("speaker") then
+        return true
+    end
+    if s:find("مرد") or s:find("عورت") or s:find("فیمیل") or s:find("میل") or s:find("راوی") then
+        return true
+    end
+    if ALL_VOICES_LOWER[s] then return true end
+    return false
+end
+
+function getNextUniqueVoice(isFemale, narratorClean)
+    local pool = isFemale and FEMALE_VOICES or MALE_VOICES
+    for i = 1, #pool do
+        local idx
+        if isFemale then
+            idx = ((dynFemaleIndex + i - 2) % #pool) + 1
+        else
+            idx = ((dynMaleIndex + i - 2) % #pool) + 1
+        end
+        local candidate = pool[idx]
+        if not usedVoices[candidate] and candidate ~= narratorClean then
+            if isFemale then
+                dynFemaleIndex = (idx % #pool) + 1
+            else
+                dynMaleIndex = (idx % #pool) + 1
+            end
+            usedVoices[candidate] = true
+            return candidate
+        end
+    end
+    if isFemale then
+        local v = pool[dynFemaleIndex] or pool[1]
+        dynFemaleIndex = (dynFemaleIndex % #pool) + 1
+        return v
+    else
+        local v = pool[dynMaleIndex] or pool[1]
+        dynMaleIndex = (dynMaleIndex % #pool) + 1
+        return v
+    end
+end
+
+function normalizeVoiceTagString(rawTag)
+    local s = string.lower(rawTag or "")
+    s = s:gsub("fifteen", "15")
+         :gsub("fourteen", "14")
+         :gsub("thirteen", "13")
+         :gsub("twelve", "12")
+         :gsub("eleven", "11")
+         :gsub("ten", "10")
+         :gsub("nine", "9")
+         :gsub("eight", "8")
+         :gsub("seven", "7")
+         :gsub("six", "6")
+         :gsub("five", "5")
+         :gsub("four", "4")
+         :gsub("three", "3")
+         :gsub("two", "2")
+         :gsub("one", "1")
+         :gsub(" voice", "")
+         :gsub("%s+", " ")
+    return s:match("^%s*(.-)%s*$") or ""
+end
+
+function parseStoryLine(line)
+    local voiceTag = ""
+    local charName = ""
+    local dialogue = line
+
+    local nA, tA, rA = line:match("^%s*([^%[%]:]+)%s*%[([^%]]+)%]%s*:%s*(.*)")
+    if nA and tA and isRecognizedVoiceTag(tA) then
+        charName = string.lower(nA:match("^%s*(.-)%s*$") or "")
+        voiceTag = string.lower(tA:match("^%s*(.-)%s*$") or "")
+        dialogue = rA
+    else
+        local tB, rB = line:match("^%s*%[([^%]]+)%]%s*:%s*(.*)")
+        if tB and isRecognizedVoiceTag(tB) then
+            voiceTag = string.lower(tB:match("^%s*(.-)%s*$") or "")
+            dialogue = rB
+        else
+            local tC, nC, rC = line:match("^%s*%[([^%]]+)%]%s*([^:]+):%s*(.*)")
+            if tC and isRecognizedVoiceTag(tC) then
+                voiceTag = string.lower(tC:match("^%s*(.-)%s*$") or "")
+                charName = string.lower(nC:match("^%s*(.-)%s*$") or "")
+                dialogue = rC
+            else
+                local tD, rD = line:match("^%s*%[([^%]]+)%]%s*(.*)")
+                if tD and isRecognizedVoiceTag(tD) then
+                    voiceTag = string.lower(tD:match("^%s*(.-)%s*$") or "")
+                    dialogue = rD
+                else
+                    local nE, rE = line:match("^%s*([^%[%]:]+):%s*(.*)")
+                    if nE and #nE < 60 then
+                        charName = string.lower(nE:match("^%s*(.-)%s*$") or "")
+                        dialogue = rE
+                    end
+                end
+            end
+        end
+    end
+
+    local narratorClean = selectedNarrator:match("^(%w+)") or "Orus"
+    usedVoices[narratorClean] = true
+    local voiceToUse = narratorClean
+
+    if charName ~= "" and assignedVoices["char_" .. charName] then
+        local prepText, pauseSec = cleanDialogueAndExtractPause(dialogue)
+        return assignedVoices["char_" .. charName], prepText, pauseSec
+    end
+
+    if voiceTag ~= "" then
+        local normalizedTag = normalizeVoiceTagString(voiceTag)
+        if normalizedTag:find("narrator") or normalizedTag:find("راوی") then
+            voiceToUse = narratorClean
+        elseif assignedVoices["tag_" .. normalizedTag] then
+            voiceToUse = assignedVoices["tag_" .. normalizedTag]
+        elseif FEMALE_MAPPING[normalizedTag] then
+            voiceToUse = FEMALE_MAPPING[normalizedTag]
+            usedVoices[voiceToUse] = true
+            assignedVoices["tag_" .. normalizedTag] = voiceToUse
+        elseif MALE_MAPPING[normalizedTag] then
+            voiceToUse = MALE_MAPPING[normalizedTag]
+            usedVoices[voiceToUse] = true
+            assignedVoices["tag_" .. normalizedTag] = voiceToUse
+        elseif ALL_VOICES_LOWER[normalizedTag] then
+            voiceToUse = ALL_VOICES_LOWER[normalizedTag]
+            usedVoices[voiceToUse] = true
+            assignedVoices["tag_" .. normalizedTag] = voiceToUse
+        else
+            local isFem = isFemaleUrduOrEnglishName(normalizedTag) or isFemaleUrduOrEnglishName(charName)
+            voiceToUse = getNextUniqueVoice(isFem, narratorClean)
+            assignedVoices["tag_" .. normalizedTag] = voiceToUse
+        end
+        if charName ~= "" then
+            assignedVoices["char_" .. charName] = voiceToUse
+        end
+    elseif charName ~= "" then
+        local normChar = normalizeVoiceTagString(charName)
+        if charName:find("narrator") or charName:find("راوی") then
+            voiceToUse = narratorClean
+        elseif FEMALE_MAPPING[normChar] then
+            voiceToUse = FEMALE_MAPPING[normChar]
+            usedVoices[voiceToUse] = true
+            assignedVoices["char_" .. charName] = voiceToUse
+        elseif MALE_MAPPING[normChar] then
+            voiceToUse = MALE_MAPPING[normChar]
+            usedVoices[voiceToUse] = true
+            assignedVoices["char_" .. charName] = voiceToUse
+        else
+            local isFemChar = isFemaleUrduOrEnglishName(charName)
+            voiceToUse = getNextUniqueVoice(isFemChar, narratorClean)
+            assignedVoices["char_" .. charName] = voiceToUse
+        end
+    end
+
+    local prepText, pauseSec = cleanDialogueAndExtractPause(dialogue)
+    return voiceToUse, prepText, pauseSec
+end
+
+function parseBroadcastLine(line)
+    local spkNumStr, rest = line:match("^%s*[Ss][Pp][Ee][Aa][Kk][Ee][Rr]%s*(%d+)%s*:%s*(.*)")
+    local spkIdx = 1
+    local dialogue = line
+    if spkNumStr then
+        local n = tonumber(spkNumStr) or 1
+        if n < 1 then n = 1 end
+        if n > broadcastSpeakerCount then n = ((n - 1) % broadcastSpeakerCount) + 1 end
+        spkIdx = n
+        dialogue = rest
+    else
+        local anyLabel, anyRest = line:match("^%s*[^:]+:%s*(.*)")
+        if anyRest and #line - #anyRest < 35 then
+            dialogue = anyRest
+        end
+    end
+    local vDisplay = broadcastVoices[spkIdx] or "Puck (Male)"
+    local cleanV = vDisplay:match("^(%w+)") or "Puck"
+    local prepText, pauseSec = cleanDialogueAndExtractPause(dialogue)
+    return cleanV, prepText, pauseSec
+end
+
+function splitSingleChunkSafe(text, minChars, maxChars)
+    local subChunks = {}
+    local minC = minChars or MIN_CHUNK_SIZE
+    local maxC = maxChars or MAX_CHUNK_SIZE
+    local totalBytes = #text
+    local chunkStart = 1
+
+    while chunkStart <= totalBytes do
+        local pos = chunkStart
+        local charCount = 0
+        local lastPunctEnd = nil
+        local lastSpaceEnd = nil
+
+        while pos <= totalBytes and charCount < maxC do
+            local b = string.byte(text, pos)
+            local charLen = 1
+            if b >= 240 then charLen = 4
+            elseif b >= 224 then charLen = 3
+            elseif b >= 192 then charLen = 2 end
+            local charEnd = math.min(totalBytes, pos + charLen - 1)
+            local ch = text:sub(pos, charEnd)
+            charCount = charCount + 1
+
+            if charCount >= minC then
+                if ch == "." or ch == "!" or ch == "?" or ch == "\n" or ch == "۔" or ch == "؟" or ch == "।" or ch == "。" then
+                    lastPunctEnd = charEnd
+                elseif ch == " " or ch == "\t" then
+                    lastSpaceEnd = charEnd
+                end
+            end
+            pos = charEnd + 1
+        end
+
+        if pos > totalBytes then
+            local part = text:sub(chunkStart, totalBytes)
+            if part:match("%S") then table.insert(subChunks, part) end
+            break
+        end
+
+        local splitEnd = pos - 1
+        if lastPunctEnd then
+            splitEnd = lastPunctEnd
+        elseif lastSpaceEnd then
+            splitEnd = lastSpaceEnd
+        end
+
+        local part = text:sub(chunkStart, splitEnd)
+        if part:match("%S") then table.insert(subChunks, part) end
+        chunkStart = splitEnd + 1
+    end
+
+    return subChunks
+end
+
+function buildQuotaSavingJobs(text, modeName)
+    local jobs = {}
+    if text == nil or text == "" then return jobs end
+    text = text:gsub("\r\n", "\n"):gsub("\r", "\n"):gsub("[%z\1-\8\11-\31\127]", "")
+
+    local ok, jLen = pcall(function() return String(text).length() end)
+    if ok and jLen > MAX_TOTAL_CHARS then
+        pcall(function() text = tostring(String(text).substring(0, MAX_TOTAL_CHARS)) end)
+    end
+
+    if modeName == "single" then
+        local chunks = splitSingleChunkSafe(text, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE)
+        local cleanV = selectedVoice:match("^(%w+)") or "Puck"
+        for _, ch in ipairs(chunks) do
+            local cleaned, pSec = cleanDialogueAndExtractPause(ch)
+            if cleaned ~= "" then
+                table.insert(jobs, {
+                    mode = "single",
+                    voice1 = cleanV,
+                    text = cleaned,
+                    pauseAfter = pSec
+                })
+            elseif pSec > 0 then
+                table.insert(jobs, { mode = "silence", pauseAfter = pSec })
+            end
+        end
+        return jobs
+    end
+
+    local parsedItems = {}
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        local trimmed = line:match("^%s*(.-)%s*$")
+        if trimmed == "" then
+            if modeName == "story" and #parsedItems > 0 and parsedItems[#parsedItems].pauseAfter == 0 then
+                parsedItems[#parsedItems].pauseAfter = 0.4
+            end
+        else
+            local v, txt, pSec
+            if modeName == "story" then
+                v, txt, pSec = parseStoryLine(trimmed)
+            else
+                v, txt, pSec = parseBroadcastLine(trimmed)
+            end
+            if txt ~= "" then
+                local okLen, cLen = pcall(function() return String(txt).length() end)
+                if okLen and cLen > MAX_BATCH_CHARS then
+                    local subs = splitSingleChunkSafe(txt, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE)
+                    for idx, sp in ipairs(subs) do
+                        table.insert(parsedItems, {
+                            voice = v,
+                            text = sp,
+                            pauseAfter = (idx == #subs) and pSec or 0
+                        })
+                    end
+                else
+                    table.insert(parsedItems, { voice = v, text = txt, pauseAfter = pSec })
+                end
+            elseif pSec > 0 then
+                table.insert(parsedItems, { voice = nil, text = "", pauseAfter = pSec })
+            end
+        end
+    end
+
+    local curVoice1 = nil
+    local curVoice2 = nil
+    local curLines = {}
+    local curCharCount = 0
+    local curPauseAfter = 0
+
+    local function flushBatch()
+        if #curLines == 0 then
+            if curPauseAfter > 0 then
+                table.insert(jobs, { mode = "silence", pauseAfter = curPauseAfter })
+                curPauseAfter = 0
+            end
+            return
+        end
+        if curVoice2 == nil then
+            local parts = {}
+            for _, item in ipairs(curLines) do
+                table.insert(parts, item.text)
+            end
+            table.insert(jobs, {
+                mode = "single",
+                voice1 = curVoice1,
+                text = table.concat(parts, "\n"),
+                pauseAfter = curPauseAfter
+            })
+        else
+            local parts = {}
+            for _, item in ipairs(curLines) do
+                local tag = (item.voice == curVoice1) and "Speaker1: " or "Speaker2: "
+                table.insert(parts, tag .. item.text)
+            end
+            table.insert(jobs, {
+                mode = "multi2",
+                voice1 = curVoice1,
+                voice2 = curVoice2,
+                text = table.concat(parts, "\n"),
+                pauseAfter = curPauseAfter
+            })
+        end
+        curVoice1 = nil
+        curVoice2 = nil
+        curLines = {}
+        curCharCount = 0
+        curPauseAfter = 0
+    end
+
+    for _, item in ipairs(parsedItems) do
+        if item.text == "" and item.pauseAfter > 0 then
+            curPauseAfter = curPauseAfter + item.pauseAfter
+            flushBatch()
+        else
+            local okLen, itemChars = pcall(function() return String(item.text).length() end)
+            local cLen = okLen and itemChars or #item.text
+
+            local canJoin = false
+            if curVoice1 == nil then
+                canJoin = true
+            elseif (curCharCount + cLen) <= MAX_BATCH_CHARS then
+                if item.voice == curVoice1 or item.voice == curVoice2 then
+                    canJoin = true
+                elseif curVoice2 == nil then
+                    canJoin = true
+                end
+            end
+
+            if not canJoin then
+                flushBatch()
+            end
+
+            if curVoice1 == nil then
+                curVoice1 = item.voice
+            elseif curVoice2 == nil and item.voice ~= curVoice1 then
+                curVoice2 = item.voice
+            end
+
+            table.insert(curLines, item)
+            curCharCount = curCharCount + cLen
+            if item.pauseAfter and item.pauseAfter > 0 then
+                curPauseAfter = item.pauseAfter
+                flushBatch()
+            end
+        end
+    end
+    flushBatch()
+    return jobs
+end
+
+function getOrderedModels()
+    local list = {selectedModel}
+    for _, m in ipairs(TTS_MODELS) do
+        if m ~= selectedModel then
+            table.insert(list, m)
+        end
+    end
+    return list
+end
+
+function extractRawPcmBytes(audioBytes)
+    if not audioBytes or #audioBytes <= 44 then return nil end
+    local isRiff = false
+    pcall(function()
+        if audioBytes[0] == 0x52 and audioBytes[1] == 0x49 and audioBytes[2] == 0x46 and audioBytes[3] == 0x46 then
+            isRiff = true
+        end
+    end)
+    return audioBytes, isRiff
+end
+
+function callGeminiTextModel(promptText, modelIndex, retryCount, genId, callback)
+    if cancellationRequested or genId ~= currentGenerationId then
+        runOnUi(function() callback(false, "Cancelled by user") end)
+        return
+    end
+    if not isNetworkAvailable() then
+        runOnUi(function() callback(false, "No internet connection") end)
+        return
+    end
+    if modelIndex > #TEXT_MODELS then
+        runOnUi(function() callback(false, "All text models failed") end)
+        return
+    end
+    local validKeys = getValidApiKeysList()
+    if #validKeys == 0 then
+        runOnUi(function() callback(false, "No API Keys configured") end)
+        return
+    end
+
+    local apikey = getWorkingApiKey()
+    local currentModel = TEXT_MODELS[modelIndex]
+    local apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/" .. currentModel .. ":generateContent?key=" .. URLEncoder.encode(apikey, "UTF-8")
+    local requestBody = {
+        contents = {{parts = {{text = promptText}}}},
+        generationConfig = {temperature = 0.85, maxOutputTokens = 8192}
+    }
+    local headers = HashMap()
+    headers.put("Content-Type", "application/json")
+
+    local maxKeyRetries = math.max(1, #validKeys)
+    activeHttpRequest = Http.post(apiUrl, cjson.encode(requestBody), headers, function(code, content)
+        activeHttpRequest = nil
+        if cancellationRequested or genId ~= currentGenerationId then
+            runOnUi(function() callback(false, "Cancelled by user") end)
+            return
+        end
+        local numCode = tonumber(code) or -1
+        if numCode == 200 then
+            local ok, data = pcall(cjson.decode, content)
+            if ok and data and data.candidates and #data.candidates > 0 then
+                local cand = data.candidates[1]
+                if cand.content and cand.content.parts then
+                    local outParts = {}
+                    for i = 1, #cand.content.parts do
+                        if cand.content.parts[i].text then
+                            table.insert(outParts, cand.content.parts[i].text)
+                        end
+                    end
+                    local fullRes = table.concat(outParts, "\n"):match("^%s*(.-)%s*$")
+                    if fullRes ~= "" then
+                        runOnUi(function() callback(true, fullRes, currentModel) end)
+                        return
+                    end
+                end
+            end
+            callGeminiTextModel(promptText, modelIndex + 1, 0, genId, callback)
+        elseif numCode == 429 or numCode == 401 or numCode == 403 or numCode == 500 or numCode == 503 then
+            if retryCount + 1 < maxKeyRetries then
+                rotateToNextWorkingApiKey()
+                delay(1200, function() callGeminiTextModel(promptText, modelIndex, retryCount + 1, genId, callback) end)
+            elseif modelIndex < #TEXT_MODELS then
+                rotateToNextWorkingApiKey()
+                callGeminiTextModel(promptText, modelIndex + 1, 0, genId, callback)
+            else
+                local reason = (numCode == 429) and "Rate limit exceeded (429) on all API keys" or ("Text API Error HTTP " .. tostring(numCode))
+                logAppError("SCRIPT_AI", reason)
+                runOnUi(function() callback(false, reason) end)
+            end
+        else
+            if modelIndex < #TEXT_MODELS then
+                callGeminiTextModel(promptText, modelIndex + 1, 0, genId, callback)
+            else
+                local errMsg = (numCode <= 0) and "Network connection lost or timeout" or ("HTTP Error " .. tostring(numCode))
+                logAppError("SCRIPT_AI", errMsg)
+                runOnUi(function() callback(false, errMsg) end)
+            end
+        end
+    end)
+end
+
+function getTargetDurationMinutes(customEdit)
+    if selectedDuration == "1 Minute" then return 1
+    elseif selectedDuration == "5 Minutes" then return 5
+    elseif selectedDuration == "10 Minutes" then return 10
+    elseif selectedDuration == "15 Minutes" then return 15
+    elseif selectedDuration == "1 Hour (60 Minutes)" then return 60
+    else
+        local val = tonumber(customEdit and customEdit.getText().toString() or customMinutesStr) or 10
+        if val < 1 then val = 1 end
+        if val > 60 then val = 60 end
+        return math.floor(val)
+    end
+end
+
+function runCreateBroadcastScript(views)
+    local rawInput = views.textInput.getText().toString():match("^%s*(.-)%s*$")
+    if rawInput == "" then showToast("Enter a topic or text first!") return end
+    if not getWorkingApiKey() then showToast("Please configure API Key first!") showApiSettings() return end
+    if not isNetworkAvailable() then showToast("No internet connection!") return end
+
+    cancellationRequested = false
+    currentGenerationId = currentGenerationId + 1
+    local myGenId = currentGenerationId
+
+    local totalMins = getTargetDurationMinutes(views.customMinInput)
+    local segments = math.max(1, math.ceil(totalMins / 20))
+    local minsPerSeg = math.ceil(totalMins / segments)
+
+    local speakerDescList = {}
+    for i = 1, broadcastSpeakerCount do
+        local vStr = broadcastVoices[i] or "Puck (Male)"
+        local gender = vStr:find("Female") and "Female" or "Male"
+        table.insert(speakerDescList, "Speaker" .. i .. " (" .. gender .. ", Voice: " .. vStr .. ")")
+    end
+    local speakersInfo = table.concat(speakerDescList, ", ")
+
+    local moodGuide = selectedBroadcastMood
+    if selectedBroadcastMood == "Funny Jokes" then
+        moodGuide = "Funny Jokes - weave hilarious jokes, witty punchlines, teasing banter, and laugh-out-loud reactions naturally throughout the user's topic even if the source text is serious."
+    end
+
+    views.createScriptBtn.setEnabled(false)
+    views.generateBtn.setEnabled(false)
+    views.stopBtn.setEnabled(true)
+    setKeepAwake(true)
+
+    local builtParts = {}
+
+    local function finishScript(okAll, errMsg)
+        setKeepAwake(false)
+        runOnUi(function()
+            views.createScriptBtn.setEnabled(true)
+            views.createScriptBtn.setText("CREATE SCRIPT")
+            views.generateBtn.setEnabled(true)
+            views.stopBtn.setEnabled(false)
+            if okAll and #builtParts > 0 then
+                local finalScript = table.concat(builtParts, "\n")
+                views.textInput.setText(finalScript)
+                views.statusText.setText("[100%] Script Ready in EditBox! Review it and tap GENERATE AUDIO.")
+                showToast("Script Ready in EditBox!")
+            else
+                local msg = tostring(errMsg or "Script creation failed")
+                views.statusText.setText("Error: " .. msg)
+                if not cancellationRequested then
+                    showErrorDialog(msg)
+                end
+            end
+        end)
+    end
+
+    local function buildSegment(segIdx)
+        if cancellationRequested or myGenId ~= currentGenerationId then
+            finishScript(false, "Cancelled by user")
+            return
+        end
+        if segIdx > segments then
+            finishScript(true)
+            return
+        end
+
+        local pct = math.max(5, math.floor(((segIdx - 1) / segments) * 100))
+        runOnUi(function()
+            views.createScriptBtn.setText("WRITING SCRIPT (" .. pct .. "%)...")
+            views.statusText.setText("[" .. pct .. "%] Writing " .. totalMins .. " min script (Part " .. segIdx .. "/" .. segments .. ")...")
+        end)
+
+        local targetWords = minsPerSeg * 145
+        local prevContext = ""
+        if #builtParts > 0 then
+            local lastStr = builtParts[#builtParts]
+            local tail = (#lastStr > 700) and lastStr:sub(#lastStr - 699) or lastStr
+            prevContext = "\nContinue seamlessly from this previous ending without repeating the intro:\n" .. tail .. "\n"
+        end
+        local closingRule = (segIdx == segments) and "End with a warm, lively studio sign-off." or "Do NOT end the show yet; keep the conversation flowing for the next segment."
+        local openingRule = (segIdx == 1) and "Start with a lively studio greeting and intro." or "Continue directly into the live discussion."
+
+        local prompt = "You are an award-winning radio/podcast scriptwriter.\n" ..
+            "Write a super natural, interactive " .. broadcastSpeakerCount .. "-host broadcast conversation.\n" ..
+            "Hosts: " .. speakersInfo .. "\n" ..
+            "Broadcast Mood/Style: " .. moodGuide .. "\n" ..
+            "INTERACTION RULE (CRITICAL): The hosts MUST actively talk TO EACH OTHER like real humans in a live studio - asking each other questions, reacting spontaneously, playfully teasing/bantering in comedy moods, or debating and cross-questioning in serious moods. NEVER sound like robotic reading of a document.\n" ..
+            "Target length for this segment: approximately " .. targetWords .. " words (" .. minsPerSeg .. " minutes of speech).\n" ..
+            "LANGUAGE RULE: Write strictly in the EXACT same language and script as the user's input text below (Urdu script if Urdu, English if English, Roman Urdu if Roman Urdu, Hindi if Hindi, etc.). Never insert English stage directions or English prefixes.\n" ..
+            "FORMAT RULE: Output ONLY dialogue lines using exact labels Speaker1:, Speaker2:, ..., Speaker" .. broadcastSpeakerCount .. ": at the start of every line. Every host must speak regularly. No markdown, no asterisks, no brackets, no extra explanations.\n" ..
+            openingRule .. " " .. closingRule .. prevContext ..
+            "\nUser Topic / Source Text:\n" .. rawInput
+
+        callGeminiTextModel(prompt, 1, 0, myGenId, function(ok, resText)
+            if not ok then
+                finishScript(false, resText)
+                return
+            end
+            local cleaned = resText:gsub("```[%w]*", ""):gsub("```", ""):gsub("%*%*", ""):match("^%s*(.-)%s*$")
+            table.insert(builtParts, cleaned)
+            delay(500, function() buildSegment(segIdx + 1) end)
+        end)
+    end
+
+    buildSegment(1)
+end
+
+function runCreateStoryScript(views)
+    local rawStory = views.textInput.getText().toString():match("^%s*(.-)%s*$")
+    if rawStory == "" then showToast("Paste your story text first!") return end
+    if not getWorkingApiKey() then showToast("Please configure API Key first!") showApiSettings() return end
+    if not isNetworkAvailable() then showToast("No internet connection!") return end
+
+    cancellationRequested = false
+    currentGenerationId = currentGenerationId + 1
+    local myGenId = currentGenerationId
+
+    local storyChunks = splitSingleChunkSafe(rawStory, 6500, 8000)
+    local totalParts = #storyChunks
+    local formattedParts = {}
+    local characterRoster = {}
+
+    views.createStoryBtn.setEnabled(false)
+    views.generateBtn.setEnabled(false)
+    views.stopBtn.setEnabled(true)
+    setKeepAwake(true)
+
+    local function finishStoryFormat(okAll, errMsg)
+        setKeepAwake(false)
+        runOnUi(function()
+            views.createStoryBtn.setEnabled(true)
+            views.createStoryBtn.setText("CREATE STORY")
+            views.generateBtn.setEnabled(true)
+            views.stopBtn.setEnabled(false)
+            if okAll and #formattedParts > 0 then
+                views.textInput.setText(table.concat(formattedParts, "\n\n"))
+                views.statusText.setText("[100%] Story Script Ready! Review it and tap GENERATE AUDIO.")
+                showToast("Story formatted with character voices!")
+            else
+                local msg = tostring(errMsg or "Story formatting failed")
+                views.statusText.setText("Error: " .. msg)
+                if not cancellationRequested then showErrorDialog(msg) end
+            end
+        end)
+    end
+
+    local function extractCharacterTags(textBlock)
+        for line in (textBlock .. "\n"):gmatch("([^\n]*)\n") do
+            local cName, vTag = line:match("^%s*([^%[%]:]+)%s*%[([^%]]+Voice)%]%s*:")
+            if cName and vTag then
+                local cleanC = cName:match("^%s*(.-)%s*$")
+                local cleanT = vTag:match("^%s*(.-)%s*$")
+                if cleanC ~= "" and not string.lower(cleanT):find("narrator") then
+                    characterRoster[cleanC] = cleanT
+                end
+            end
+        end
+    end
+
+    local function formatPart(idx)
+        if cancellationRequested or myGenId ~= currentGenerationId then
+            finishStoryFormat(false, "Cancelled by user")
+            return
+        end
+        if idx > totalParts then
+            finishStoryFormat(true)
+            return
+        end
+
+        local pct = math.max(5, math.floor(((idx - 1) / totalParts) * 100))
+        runOnUi(function()
+            views.createStoryBtn.setText("CREATING STORY (" .. pct .. "%)...")
+            views.statusText.setText("[" .. pct .. "%] Formatting story part " .. idx .. " of " .. totalParts .. "...")
+        end)
+
+        local rosterLines = {}
+        for cName, vTag in pairs(characterRoster) do
+            table.insert(rosterLines, cName .. " -> [" .. vTag .. "]")
+        end
+        local rosterHint = (#rosterLines > 0) and ("\nALREADY ASSIGNED CHARACTER VOICES (MUST KEEP IDENTICAL):\n" .. table.concat(rosterLines, "\n") .. "\n") or ""
+
+        local prompt = "Convert the following story into a multi-voice audiobook script WITHOUT omitting, summarizing, or changing any events or language.\n" ..
+            "STRICT RULES:\n" ..
+            "1. Keep the EXACT language and script of the story.\n" ..
+            "2. Every narration paragraph MUST start with: [Narrator Voice]: \n" ..
+            "3. Every spoken dialogue MUST be formatted as: CharacterName [Male One Voice]: dialogue  OR  CharacterName [Female One Voice]: dialogue\n" ..
+            "4. Carefully detect each character's TRUE gender from their name, titles (like Aunty, Begum, Masi, Bibi, Sister, Chacha, Khan, Baba), and verb grammar (like boli/kehti hai = Female, bola/kehta hai = Male).\n" ..
+            "5. Use strictly Male One Voice through Male Fifteen Voice ONLY for male characters, and Female One Voice through Female Thirteen Voice ONLY for female characters.\n" ..
+            "6. NEVER assign a Female voice to a Male character or a Male voice to a Female character. NEVER give two different characters the same voice tag.\n" ..
+            "7. Do NOT add English emotion words or bracketed stage notes inside the dialogue text. Output ONLY the clean formatted script.\n" ..
+            rosterHint .. "\nSTORY TEXT:\n" .. storyChunks[idx]
+
+        callGeminiTextModel(prompt, 1, 0, myGenId, function(ok, resText)
+            if not ok then
+                finishStoryFormat(false, resText)
+                return
+            end
+            local cleaned = resText:gsub("```[%w]*", ""):gsub("```", ""):gsub("%*%*", ""):match("^%s*(.-)%s*$")
+            extractCharacterTags(cleaned)
+            table.insert(formattedParts, cleaned)
+            delay(500, function() formatPart(idx + 1) end)
+        end)
+    end
+
+    formatPart(1)
+end
+
+function textToSpeechJob(job, modelIndex, retryCount, cooldownDone, genId, statusViews, callback)
+    if cancellationRequested or genId ~= currentGenerationId then
+        runOnUi(function() callback(false, nil, false, "Cancelled by user") end)
+        return
+    end
+    if not isNetworkAvailable() then
+        runOnUi(function() callback(false, nil, false, "No internet connection") end)
+        return
+    end
+
+    local modelsList = getOrderedModels()
+    if modelIndex > #modelsList then
+        runOnUi(function() callback(false, nil, false, "All TTS models failed to generate audio") end)
+        return
+    end
+
+    local validKeys = getValidApiKeysList()
+    if #validKeys == 0 then
+        runOnUi(function() callback(false, nil, false, "No API Keys configured") end)
+        return
+    end
+
+    local apikey = getWorkingApiKey()
+    local currentModel = modelsList[modelIndex]
+    local apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/" .. currentModel .. ":generateContent?key=" .. URLEncoder.encode(apikey, "UTF-8")
+
+    local speechCfg
+    if job.mode == "multi2" and job.voice2 then
+        speechCfg = {
+            multiSpeakerVoiceConfig = {
+                speakerVoiceConfigs = {
+                    { speaker = "Speaker1", voiceConfig = { prebuiltVoiceConfig = { voiceName = job.voice1 or "Puck" } } },
+                    { speaker = "Speaker2", voiceConfig = { prebuiltVoiceConfig = { voiceName = job.voice2 or "Kore" } } }
+                }
+            }
+        }
+    else
+        speechCfg = {
+            voiceConfig = { prebuiltVoiceConfig = { voiceName = job.voice1 or "Puck" } }
+        }
+    end
+
+    local requestBody = {
+        contents = {{parts = {{text = job.text}}}},
+        generationConfig = {
+            responseModalities = {"AUDIO"},
+            speechConfig = speechCfg
+        }
+    }
+    local headers = HashMap()
+    headers.put("Content-Type", "application/json")
+
+    local maxKeyRetries = math.max(1, #validKeys)
+
+    activeHttpRequest = Http.post(apiUrl, cjson.encode(requestBody), headers, function(code, content)
+        activeHttpRequest = nil
+        if cancellationRequested or genId ~= currentGenerationId then
+            runOnUi(function() callback(false, nil, false, "Cancelled by user") end)
+            return
+        end
+        local numCode = tonumber(code) or -1
+        if numCode == 200 then
+            local ok, data = pcall(cjson.decode, content)
+            if ok and data and data.candidates and #data.candidates > 0 then
+                local candidate = data.candidates[1]
+                if candidate.content and candidate.content.parts then
+                    for i = 1, #candidate.content.parts do
+                        local part = candidate.content.parts[i]
+                        if part.inlineData and part.inlineData.data then
+                            local okDec, audioBytes = pcall(function()
+                                return Base64.decode(part.inlineData.data, Base64.NO_WRAP)
+                            end)
+                            if okDec and audioBytes and #audioBytes > 44 then
+                                local rawBytes, hasWavHeader = extractRawPcmBytes(audioBytes)
+                                runOnUi(function() callback(true, rawBytes, hasWavHeader, currentModel) end)
+                                return
+                            end
+                        end
+                    end
+                end
+            end
+            textToSpeechJob(job, modelIndex + 1, 0, false, genId, statusViews, callback)
+        elseif numCode == 429 then
+            if retryCount + 1 < maxKeyRetries then
+                rotateToNextWorkingApiKey()
+                delay(1500, function() textToSpeechJob(job, modelIndex, retryCount + 1, cooldownDone, genId, statusViews, callback) end)
+            elseif not cooldownDone then
+                runOnUi(function()
+                    if statusViews and statusViews.statusText then
+                        statusViews.statusText.setText("Rate limit (429) - cooling down 6s before retry...")
+                    end
+                end)
+                delay(6000, function() textToSpeechJob(job, modelIndex, 0, true, genId, statusViews, callback) end)
+            elseif modelIndex < #modelsList then
+                rotateToNextWorkingApiKey()
+                delay(1500, function() textToSpeechJob(job, modelIndex + 1, 0, false, genId, statusViews, callback) end)
+            else
+                local reason = "Quota/Rate limit exceeded (429) on all API keys"
+                logAppError("TTS_API", reason)
+                runOnUi(function() callback(false, nil, false, reason) end)
+            end
+        elseif numCode == 401 or numCode == 403 or numCode == 500 or numCode == 503 then
+            if retryCount + 1 < maxKeyRetries then
+                rotateToNextWorkingApiKey()
+                delay(1000, function() textToSpeechJob(job, modelIndex, retryCount + 1, cooldownDone, genId, statusViews, callback) end)
+            elseif modelIndex < #modelsList then
+                rotateToNextWorkingApiKey()
+                textToSpeechJob(job, modelIndex + 1, 0, false, genId, statusViews, callback)
+            else
+                local reason = "API Error HTTP " .. tostring(numCode)
+                logAppError("TTS_API", reason)
+                runOnUi(function() callback(false, nil, false, reason) end)
+            end
+        elseif numCode == 400 then
+            if retryCount + 1 < maxKeyRetries then
+                rotateToNextWorkingApiKey()
+                delay(600, function() textToSpeechJob(job, modelIndex, retryCount + 1, cooldownDone, genId, statusViews, callback) end)
+            elseif modelIndex < #modelsList then
+                textToSpeechJob(job, modelIndex + 1, 0, false, genId, statusViews, callback)
+            else
+                local detail = "Invalid request or invalid API Key (HTTP 400)"
+                local okErr, errData = pcall(cjson.decode, content)
+                if okErr and errData and errData.error and errData.error.message then
+                    detail = "HTTP 400: " .. sanitizeErrorText(errData.error.message)
+                end
+                logAppError("TTS_API", detail)
+                runOnUi(function() callback(false, nil, false, detail) end)
+            end
+        else
+            local errMsg = (numCode <= 0) and "Network connection lost or timeout" or ("HTTP Error " .. tostring(numCode))
+            logAppError("TTS_API", errMsg)
+            runOnUi(function() callback(false, nil, false, errMsg) end)
+        end
+    end)
+end
+
+function generateFullAudio(text, modeName, customResumeState, views)
+    cancellationRequested = false
+    currentGenerationId = currentGenerationId + 1
+    local myGenId = currentGenerationId
+
+    local jobs, totalChunks, completedChunks, startIndex, tempPath, totalAudioLen, baseName, oldPartialPath
+    local isFinalized = false
+    local lastErrorMsg = ""
+    local failedChunkIndex = nil
+    local fos = nil
+
+    if customResumeState and customResumeState.partialWavPath and File(customResumeState.partialWavPath).exists() then
+        jobs = customResumeState.jobs
+        totalChunks = customResumeState.totalChunks
+        completedChunks = customResumeState.completedChunks
+        startIndex = customResumeState.nextIndex
+        baseName = customResumeState.baseName
+        modeName = customResumeState.modeName or modeName
+        oldPartialPath = customResumeState.partialWavPath
+
+        tempPath = getSafeBaseDir() .. "/tts_temp_" .. os.time() .. ".wav"
+        fos = FileOutputStream(File(tempPath))
+        writeWavHeader(fos, 0)
+        totalAudioLen = 0
+
+        local existingFile = File(oldPartialPath)
+        local inOld = nil
+        pcall(function()
+            inOld = FileInputStream(existingFile)
+            inOld.skip(44)
+            local buf = byte[8192]
+            while true do
+                local len = inOld.read(buf)
+                if len == -1 then break end
+                fos.write(buf, 0, len)
+                totalAudioLen = totalAudioLen + len
+            end
+        end)
+        pcall(function() if inOld then inOld.close() end end)
+    else
+        assignedVoices = {}
+        usedVoices = {}
+        dynMaleIndex = 1
+        dynFemaleIndex = 1
+
+        jobs = buildQuotaSavingJobs(text, modeName)
+        totalChunks = #jobs
+        completedChunks = 0
+        startIndex = 1
+        oldPartialPath = nil
+
+        if totalChunks == 0 then
+            runOnUi(function()
+                views.generateBtn.setEnabled(true)
+                views.generateBtn.setText("GENERATE AUDIO")
+                views.generateBtn.setBackgroundColor(Color.parseColor("#2196F3"))
+                views.stopBtn.setEnabled(false)
+                showToast("No valid text to generate")
+            end)
+            return
+        end
+
+        tempPath = getSafeBaseDir() .. "/tts_temp_" .. os.time() .. ".wav"
+        fos = FileOutputStream(File(tempPath))
+        totalAudioLen = 0
+        writeWavHeader(fos, 0)
+        baseName = userFileName ~= "" and userFileName or getDefaultFileName(modeName)
+    end
+
+    setKeepAwake(true)
+    local tempFile = File(tempPath)
+    local finalPath = getLibraryDir().getPath() .. "/" .. baseName .. ".wav"
+
+    local function finalizeAudio(isPartial, nextIdxToResume)
+        if isFinalized then return end
+        isFinalized = true
+        setKeepAwake(false)
+        pcall(function() fos.flush() fos.close() end)
+
+        if totalAudioLen <= 0 then
+            pcall(function() tempFile.delete() end)
+            runOnUi(function()
+                views.generateBtn.setEnabled(true)
+                views.generateBtn.setText("GENERATE AUDIO")
+                views.generateBtn.setBackgroundColor(Color.parseColor("#2196F3"))
+                views.stopBtn.setEnabled(false)
+                local msg = cancellationRequested and "Generation stopped by user." or ("Failed: " .. (lastErrorMsg ~= "" and lastErrorMsg or "Could not generate audio"))
+                views.statusText.setText(msg)
+                showToast(msg)
+                if not cancellationRequested and lastErrorMsg ~= "" then
+                    showErrorDialog(msg)
+                end
+            end)
+            return
+        end
+
+        local actualFinalPath = isPartial and (getLibraryDir().getPath() .. "/PARTIAL_" .. baseName .. ".wav") or finalPath
+
+        local finalFos = nil
+        local tempInput = nil
+        local writeOk = pcall(function()
+            finalFos = FileOutputStream(File(actualFinalPath))
+            writeWavHeader(finalFos, totalAudioLen)
+            tempInput = FileInputStream(tempFile)
+            tempInput.skip(44)
+            local buffer = byte[8192]
+            while true do
+                local len = tempInput.read(buffer)
+                if len == -1 then break end
+                finalFos.write(buffer, 0, len)
+            end
+            finalFos.flush()
+        end)
+        pcall(function() if tempInput then tempInput.close() end end)
+        pcall(function() if finalFos then finalFos.close() end end)
+        pcall(function() tempFile.delete() end)
+
+        if not writeOk then
+            logAppError("FILE_WRITE", "Failed writing final WAV: " .. tostring(actualFinalPath))
+            runOnUi(function()
+                views.generateBtn.setEnabled(true)
+                views.generateBtn.setText("GENERATE AUDIO")
+                views.generateBtn.setBackgroundColor(Color.parseColor("#2196F3"))
+                views.stopBtn.setEnabled(false)
+                views.statusText.setText("Error saving audio file to storage.")
+                showToast("Error saving audio file")
+            end)
+            return
+        end
+
+        if isPartial and nextIdxToResume and nextIdxToResume <= totalChunks then
+            resumeState = {
+                jobs = jobs,
+                totalChunks = totalChunks,
+                completedChunks = completedChunks,
+                nextIndex = nextIdxToResume,
+                partialWavPath = actualFinalPath,
+                totalAudioLen = totalAudioLen,
+                baseName = baseName,
+                modeName = modeName
+            }
+            saveResumeMetaToDisk(resumeState)
+        else
+            if oldPartialPath and oldPartialPath ~= actualFinalPath then
+                pcall(function() File(oldPartialPath).delete() end)
+                deleteResumeMetaFromDisk(oldPartialPath)
+            end
+            deleteResumeMetaFromDisk(actualFinalPath)
+            resumeState = nil
+        end
+
+        generatedAudioPath = actualFinalPath
+        local durText = formatDurationReadable(getAudioDurationSec(generatedAudioPath))
+
+        runOnUi(function()
+            views.resultLayout.setVisibility(View.VISIBLE)
+            initMainMediaPlayer()
+            pcall(function()
+                mainMediaPlayer.setDataSource(generatedAudioPath)
+                mainMediaPlayer.prepare()
+                mainMediaPlayer.setOnCompletionListener(MediaPlayer.OnCompletionListener{
+                    onCompletion = function(mp)
+                        isMainPlaying = false
+                        runOnUi(function() views.playBtn.setText("PLAY") end)
+                    end
+                })
+            end)
+            views.playBtn.setEnabled(true)
+            views.playBtn.setText("PLAY")
+            views.generateBtn.setEnabled(true)
+            views.generateBtn.setText("REGENERATE")
+            views.generateBtn.setBackgroundColor(Color.parseColor("#2196F3"))
+            views.stopBtn.setEnabled(false)
+
+            if isPartial then
+                if resumeState then
+                    views.resumeBtn.setVisibility(View.VISIBLE)
+                    views.resumeBtn.setText("RESUME AUDIO (" .. resumeState.nextIndex .. "/" .. totalChunks .. ")")
+                else
+                    views.resumeBtn.setVisibility(View.GONE)
+                end
+                local pct = math.floor((completedChunks / totalChunks) * 100)
+                if cancellationRequested then
+                    views.statusText.setText("[" .. pct .. "%] Stopped: Saved " .. completedChunks .. "/" .. totalChunks .. " parts (" .. durText .. "). Tap RESUME AUDIO or resume from Audio Library.")
+                    showToast("Stopped! Partial Audio Saved.")
+                else
+                    local failNote = "[" .. pct .. "%] Part " .. tostring(failedChunkIndex or nextIdxToResume) .. " failed (" .. lastErrorMsg .. "). Saved " .. completedChunks .. "/" .. totalChunks .. " parts (" .. durText .. ")."
+                    views.statusText.setText(failNote)
+                    showToast("Paused on error. Resume from Home or Audio Library.")
+                end
+            else
+                views.resumeBtn.setVisibility(View.GONE)
+                local labelPrefix = (modeName == "broadcast") and "Broadcast Ready" or ((modeName == "story") and "Story Ready" or "Audio Ready")
+                views.statusText.setText("[100%] " .. labelPrefix .. " (" .. durText .. ") | Parts: " .. completedChunks .. "/" .. totalChunks)
+                showToast("Saved to Audio Library (" .. durText .. ")!")
+            end
+        end)
+    end
+
+    local function processNextJob(index)
+        if cancellationRequested or myGenId ~= currentGenerationId then
+            finalizeAudio(true, index)
+            return
+        end
+        if index > totalChunks then
+            finalizeAudio(false, nil)
+            return
+        end
+
+        local curPct = math.floor((completedChunks / totalChunks) * 100)
+        local rem = totalChunks - completedChunks
+        runOnUi(function()
+            views.generateBtn.setText("GENERATING AUDIO (" .. curPct .. "%)...")
+            views.statusText.setText("[" .. curPct .. "%] Parts: " .. completedChunks .. "/" .. totalChunks .. " done | " .. rem .. " remaining")
+        end)
+
+        local job = jobs[index]
+        if job.mode == "silence" then
+            local added = writeSilenceSeconds(fos, job.pauseAfter or 0.5)
+            totalAudioLen = totalAudioLen + added
+            completedChunks = completedChunks + 1
+            processNextJob(index + 1)
+            return
+        end
+
+        textToSpeechJob(job, 1, 0, false, myGenId, views, function(success, audioBytes, hasWavHeader, errOrModel)
+            if cancellationRequested or myGenId ~= currentGenerationId then
+                finalizeAudio(true, index)
+                return
+            end
+            if not success or not audioBytes then
+                failedChunkIndex = index
+                lastErrorMsg = tostring(errOrModel or "Generation failed")
+                finalizeAudio(true, index)
+                return
+            end
+            local offset = hasWavHeader and 44 or 0
+            local dataLen = #audioBytes - offset
+            if dataLen > 0 then
+                fos.write(audioBytes, offset, dataLen)
+                totalAudioLen = totalAudioLen + dataLen
+            end
+            if job.pauseAfter and job.pauseAfter > 0 then
+                local added = writeSilenceSeconds(fos, job.pauseAfter)
+                totalAudioLen = totalAudioLen + added
+            end
+            completedChunks = completedChunks + 1
+            local newPct = math.floor((completedChunks / totalChunks) * 100)
+            local newRem = totalChunks - completedChunks
+            runOnUi(function()
+                views.generateBtn.setText("GENERATING AUDIO (" .. newPct .. "%)...")
+                views.statusText.setText("[" .. newPct .. "%] Parts: " .. completedChunks .. "/" .. totalChunks .. " done | " .. newRem .. " remaining")
+            end)
+            delay(DELAY_BETWEEN_CHUNKS, function() processNextJob(index + 1) end)
+        end)
+    end
+
+    processNextJob(startIndex)
+end
+
+function stopLibTimer()
+    libTimerActive = false
+    if libTimerRunnable then
+        pcall(function() mainHandler.removeCallbacks(libTimerRunnable) end)
+        libTimerRunnable = nil
+    end
+end
+
+function updateActiveLibTimeText()
+    if currentPlayingInfoTxt and currentPlayingBaseInfo and libMediaPlayer then
+        pcall(function()
+            local curSec = math.floor(libMediaPlayer.getCurrentPosition() / 1000)
+            local totSec = currentPlayingTotalSec
+            if totSec <= 0 then
+                totSec = math.floor(libMediaPlayer.getDuration() / 1000)
+            end
+            currentPlayingInfoTxt.setText(currentPlayingBaseInfo .. " | " .. formatMMSS(curSec) .. " / " .. formatMMSS(totSec))
+        end)
+    end
+end
+
+function startLibTimer()
+    stopLibTimer()
+    libTimerActive = true
+    libTimerRunnable = Runnable({
+        run = function()
+            if not libTimerActive or not isLibPlaying or libMediaPlayer == nil then
+                return
+            end
+            updateActiveLibTimeText()
+            if libTimerActive and isLibPlaying then
+                mainHandler.postDelayed(libTimerRunnable, 500)
+            end
+        end
+    })
+    mainHandler.post(libTimerRunnable)
+end
+
+function buildLibBaseInfo(file, resumeMeta)
+    local fileName = file.getName()
+    local byteLen = file.length()
+    if byteLen <= 44 then
+        return fileName .. " - [Corrupt / Empty File]", 0, true
+    end
+    local sizeMB = byteLen / (1024 * 1024)
+    local durSec = math.max(0, math.floor((byteLen - 44) / 48000))
+    local suffix = ""
+    if resumeMeta then
+        suffix = string.format(" [Paused %d/%d]", resumeMeta.completedChunks or 0, resumeMeta.totalChunks or 0)
+    end
+    return string.format("%s - %.2f MB%s", fileName, sizeMB, suffix), durSec, false
+end
+
+function startResumeFromLibrary(meta, views)
+    if not meta or not views then return end
+    if not isNetworkAvailable() then
+        showToast("No internet connection!")
+        showErrorDialog("Please turn on Wi-Fi or Mobile Data to resume audio.")
+        return
+    end
+    if not getWorkingApiKey() then
+        showToast("Please configure API Key first!")
+        showApiSettings()
+        return
+    end
+    if mainMediaPlayer ~= nil then
+        pcall(function() if isMainPlaying then mainMediaPlayer.stop() end end)
+        isMainPlaying = false
+        pcall(function() mainMediaPlayer.release() end)
+        mainMediaPlayer = nil
+    end
+    resumeState = meta
+    views.playBtn.setEnabled(false)
+    views.playBtn.setText("PLAY")
+    views.resumeBtn.setVisibility(View.GONE)
+    views.generateBtn.setEnabled(false)
+    views.generateBtn.setBackgroundColor(Color.parseColor("#9E9E9E"))
+    views.stopBtn.setEnabled(true)
+    generateFullAudio("", meta.modeName or "single", meta, views)
+end
+
+function showAudioLibrary()
+    if mainMediaPlayer ~= nil then
+        pcall(function() if isMainPlaying then mainMediaPlayer.stop() end end)
+        isMainPlaying = false
+        if mainViewsRef and mainViewsRef.playBtn then
+            runOnUi(function() mainViewsRef.playBtn.setText("PLAY") end)
+        end
+    end
+
+    local rootLayout = LinearLayout(context)
+    rootLayout.setOrientation(LinearLayout.VERTICAL)
+    rootLayout.setPadding(20, 20, 20, 20)
+
+    local searchInput = EditText(context)
+    searchInput.setHint("Search audio files...")
+    searchInput.setContentDescription("Search audio files in library")
+    searchInput.setBackgroundColor(Color.parseColor("#F5F5F5"))
+    searchInput.setPadding(20, 15, 20, 15)
+    local searchParams = LinearLayout.LayoutParams(-1, -2)
+    searchParams.setMargins(0, 0, 0, 15)
+    searchInput.setLayoutParams(searchParams)
+    rootLayout.addView(searchInput)
+
+    local scroll = ScrollView(context)
+    local mainLayout = LinearLayout(context)
+    mainLayout.setOrientation(LinearLayout.VERTICAL)
+    scroll.addView(mainLayout)
+    rootLayout.addView(scroll)
+
+    local libDialog = LuaDialog(activity)
+    libDialog.setTitle("Audio Library")
+    libDialog.setView(rootLayout)
+
+    local function renderLibraryItems(filterQuery)
+        mainLayout.removeAllViews()
+        local dir = getLibraryDir()
+        local files = dir.listFiles()
+        local fileList = {}
+        local queryLower = string.lower(tostring(filterQuery or ""):match("^%s*(.-)%s*$"))
+
+        if files then
+            local ok, tbl = pcall(function() return luajava.astable(files) end)
+            if ok and tbl then
+                for _, f in ipairs(tbl) do
+                    if f and f.getName():match("%.wav$") then
+                        if queryLower == "" or string.lower(f.getName()):find(queryLower, 1, true) then
+                            table.insert(fileList, f)
+                        end
+                    end
+                end
+            else
+                for i = 0, #files - 1 do
+                    pcall(function()
+                        if files[i] and files[i].getName():match("%.wav$") then
+                            if queryLower == "" or string.lower(files[i].getName()):find(queryLower, 1, true) then
+                                table.insert(fileList, files[i])
+                            end
+                        end
+                    end)
+                end
+            end
+        end
+
+        table.sort(fileList, function(a, b) return a.lastModified() > b.lastModified() end)
+
+        if #fileList == 0 then
+            local emptyTxt = TextView(context)
+            emptyTxt.setText(queryLower == "" and "Library is empty. Generate some audio first!" or "No matching audio files found.")
+            emptyTxt.setGravity(Gravity.CENTER)
+            emptyTxt.setPadding(0, 50, 0, 0)
+            mainLayout.addView(emptyTxt)
+            return
+        end
+
+        for _, f in ipairs(fileList) do
+            local currentFile = f
+            local filePath = currentFile.getPath()
+            local fileName = currentFile.getName()
+            local resumeMeta = loadResumeMetaFromDisk(filePath)
+            local baseInfo, totalSec, isCorrupt = buildLibBaseInfo(currentFile, resumeMeta)
+            local currentSpeed = 1.0
+
+            local card = LinearLayout(context)
+            card.setOrientation(LinearLayout.VERTICAL)
+            card.setBackgroundColor(Color.parseColor("#E3F2FD"))
+            local params = LinearLayout.LayoutParams(-1, -2)
+            params.setMargins(0, 0, 0, 20)
+            card.setLayoutParams(params)
+            card.setPadding(20, 20, 20, 20)
+
+            local infoTxt = TextView(context)
+            infoTxt.setText(isCorrupt and baseInfo or (baseInfo .. " | 00:00 / " .. formatMMSS(totalSec)))
+            infoTxt.setTextColor(isCorrupt and Color.parseColor("#D32F2F") or Color.parseColor("#000000"))
+            infoTxt.setTypeface(Typeface.DEFAULT_BOLD)
+            infoTxt.setTextSize(14)
+            infoTxt.setPadding(0, 5, 0, 10)
+            card.addView(infoTxt)
+
+            local controlsLayout = LinearLayout(context)
+            controlsLayout.setOrientation(LinearLayout.HORIZONTAL)
+            controlsLayout.setGravity(Gravity.CENTER)
+            controlsLayout.setPadding(0, 15, 0, 15)
+
+            local btnRewind = Button(context)
+            btnRewind.setText("REWIND 30s")
+            btnRewind.setContentDescription("Rewind 30 seconds")
+            local pRw = LinearLayout.LayoutParams(0, -2)
+            pRw.weight = 1
+            btnRewind.setLayoutParams(pRw)
+
+            local btnPlay = Button(context)
+            btnPlay.setText("PLAY")
+            btnPlay.setContentDescription("Play " .. fileName)
+            local pPl = LinearLayout.LayoutParams(0, -2)
+            pPl.weight = 1
+            pPl.setMargins(8, 0, 8, 0)
+            btnPlay.setLayoutParams(pPl)
+
+            local btnForward = Button(context)
+            btnForward.setText("FORWARD 30s")
+            btnForward.setContentDescription("Forward 30 seconds")
+            local pFw = LinearLayout.LayoutParams(0, -2)
+            pFw.weight = 1
+            btnForward.setLayoutParams(pFw)
+
+            controlsLayout.addView(btnRewind)
+            controlsLayout.addView(btnPlay)
+            controlsLayout.addView(btnForward)
+            card.addView(controlsLayout)
+
+            local speedLayout = LinearLayout(context)
+            speedLayout.setOrientation(LinearLayout.HORIZONTAL)
+            speedLayout.setGravity(Gravity.CENTER_VERTICAL)
+
+            local speedLabel = TextView(context)
+            speedLabel.setText("Speed: 1.0x")
+
+            local speedBar = SeekBar(context)
+            local barParams = LinearLayout.LayoutParams(-1, -2)
+            barParams.weight = 1
+            speedBar.setLayoutParams(barParams)
+            speedBar.setMax(15)
+            speedBar.setProgress(5)
+            speedBar.setContentDescription("Playback speed slider")
+
+            speedLayout.addView(speedLabel)
+            speedLayout.addView(speedBar)
+            card.addView(speedLayout)
+
+            if resumeMeta then
+                local btnLibResume = Button(context)
+                btnLibResume.setText("RESUME (" .. tostring(resumeMeta.nextIndex) .. "/" .. tostring(resumeMeta.totalChunks) .. ")")
+                btnLibResume.setBackgroundColor(Color.parseColor("#FF9800"))
+                btnLibResume.setTextColor(Color.WHITE)
+                local pRes = LinearLayout.LayoutParams(-1, -2)
+                pRes.topMargin = 12
+                btnLibResume.setLayoutParams(pRes)
+                card.addView(btnLibResume)
+
+                btnLibResume.onClick = function()
+                    stopLibTimer()
+                    if libMediaPlayer then
+                        pcall(function() libMediaPlayer.stop() libMediaPlayer.release() end)
+                        libMediaPlayer = nil
+                        isLibPlaying = false
+                        currentPlayingPath = nil
+                    end
+                    libDialog.dismiss()
+                    startResumeFromLibrary(resumeMeta, mainViewsRef)
+                end
+            end
+
+            local actionsRow1 = LinearLayout(context)
+            actionsRow1.setOrientation(LinearLayout.HORIZONTAL)
+            actionsRow1.setPadding(0, 15, 0, 0)
+
+            local btnDownload = Button(context)
+            btnDownload.setText("DOWNLOAD")
+            btnDownload.setBackgroundColor(Color.parseColor("#4CAF50"))
+            btnDownload.setTextColor(Color.WHITE)
+            local pDl = LinearLayout.LayoutParams(0, -2)
+            pDl.weight = 1
+            btnDownload.setLayoutParams(pDl)
+
+            local btnShare = Button(context)
+            btnShare.setText("SHARE")
+            btnShare.setBackgroundColor(Color.parseColor("#009688"))
+            btnShare.setTextColor(Color.WHITE)
+            local pSh = LinearLayout.LayoutParams(0, -2)
+            pSh.weight = 1
+            pSh.setMargins(10, 0, 0, 0)
+            btnShare.setLayoutParams(pSh)
+
+            actionsRow1.addView(btnDownload)
+            actionsRow1.addView(btnShare)
+            card.addView(actionsRow1)
+
+            local actionsRow2 = LinearLayout(context)
+            actionsRow2.setOrientation(LinearLayout.HORIZONTAL)
+            actionsRow2.setPadding(0, 10, 0, 0)
+
+            local btnRename = Button(context)
+            btnRename.setText("RENAME")
+            btnRename.setBackgroundColor(Color.parseColor("#2196F3"))
+            btnRename.setTextColor(Color.WHITE)
+            local pRn = LinearLayout.LayoutParams(0, -2)
+            pRn.weight = 1
+            btnRename.setLayoutParams(pRn)
+
+            local btnDelete = Button(context)
+            btnDelete.setText("DELETE")
+            btnDelete.setBackgroundColor(Color.parseColor("#F44336"))
+            btnDelete.setTextColor(Color.WHITE)
+            local pDel = LinearLayout.LayoutParams(0, -2)
+            pDel.weight = 1
+            pDel.setMargins(10, 0, 0, 0)
+            btnDelete.setLayoutParams(pDel)
+
+            actionsRow2.addView(btnRename)
+            actionsRow2.addView(btnDelete)
+            card.addView(actionsRow2)
+
+            btnPlay.onClick = function()
+                if isCorrupt then
+                    showToast("Cannot play corrupt or empty audio file")
+                    return
+                end
+                if currentPlayingPath == filePath and libMediaPlayer ~= nil then
+                    if isLibPlaying then
+                        pcall(function() libMediaPlayer.pause() end)
+                        isLibPlaying = false
+                        stopLibTimer()
+                        updateActiveLibTimeText()
+                        runOnUi(function()
+                            btnPlay.setText("PLAY")
+                            btnPlay.setContentDescription("Play " .. fileName)
+                        end)
+                    else
+                        local okRes = pcall(function()
+                            if Build.VERSION.SDK_INT >= 23 then
+                                local p = PlaybackParams()
+                                p.setSpeed(currentSpeed)
+                                libMediaPlayer.setPlaybackParams(p)
+                            end
+                            libMediaPlayer.start()
+                        end)
+                        if okRes then
+                            isLibPlaying = true
+                            runOnUi(function()
+                                btnPlay.setText("PAUSE")
+                                btnPlay.setContentDescription("Pause " .. fileName)
+                            end)
+                            startLibTimer()
+                        end
+                    end
+                else
+                    stopLibTimer()
+                    if libMediaPlayer then
+                        pcall(function() libMediaPlayer.stop() libMediaPlayer.release() end)
+                        libMediaPlayer = nil
+                    end
+                    isLibPlaying = false
+                    if currentPlayingBtn then
+                        local prevBtn = currentPlayingBtn
+                        runOnUi(function() prevBtn.setText("PLAY") end)
+                    end
+                    if currentPlayingInfoTxt and currentPlayingBaseInfo then
+                        local prevInfo = currentPlayingInfoTxt
+                        local prevBase = currentPlayingBaseInfo
+                        local prevTot = currentPlayingTotalSec
+                        runOnUi(function() prevInfo.setText(prevBase .. " | 00:00 / " .. formatMMSS(prevTot)) end)
+                    end
+
+                    libMediaPlayer = MediaPlayer()
+                    local okPlay = pcall(function()
+                        libMediaPlayer.setDataSource(filePath)
+                        libMediaPlayer.prepare()
+                        if Build.VERSION.SDK_INT >= 23 then
+                            local p = PlaybackParams()
+                            p.setSpeed(currentSpeed)
+                            libMediaPlayer.setPlaybackParams(p)
+                        end
+                        libMediaPlayer.start()
+                    end)
+                    if okPlay then
+                        isLibPlaying = true
+                        currentPlayingPath = filePath
+                        currentPlayingBtn = btnPlay
+                        currentPlayingInfoTxt = infoTxt
+                        currentPlayingBaseInfo = baseInfo
+                        currentPlayingTotalSec = totalSec
+                        runOnUi(function()
+                            btnPlay.setText("PAUSE")
+                            btnPlay.setContentDescription("Pause " .. fileName)
+                        end)
+                        startLibTimer()
+
+                        libMediaPlayer.setOnCompletionListener(MediaPlayer.OnCompletionListener{
+                            onCompletion = function(mp)
+                                isLibPlaying = false
+                                stopLibTimer()
+                                currentPlayingPath = nil
+                                runOnUi(function()
+                                    btnPlay.setText("PLAY")
+                                    btnPlay.setContentDescription("Play " .. fileName)
+                                    infoTxt.setText(baseInfo .. " | 00:00 / " .. formatMMSS(totalSec))
+                                end)
+                            end
+                        })
+                    else
+                        isLibPlaying = false
+                        currentPlayingPath = nil
+                        logAppError("LIB_PLAYER", "Failed to play " .. fileName)
+                        showToast("Failed to play audio file")
+                    end
+                end
+            end
+
+            btnRewind.onClick = function()
+                if currentPlayingPath == filePath and libMediaPlayer then
+                    pcall(function()
+                        local pos = libMediaPlayer.getCurrentPosition()
+                        libMediaPlayer.seekTo(math.max(0, pos - 30000))
+                        updateActiveLibTimeText()
+                    end)
+                end
+            end
+
+            btnForward.onClick = function()
+                if currentPlayingPath == filePath and libMediaPlayer then
+                    pcall(function()
+                        local pos = libMediaPlayer.getCurrentPosition()
+                        libMediaPlayer.seekTo(math.min(libMediaPlayer.getDuration(), pos + 30000))
+                        updateActiveLibTimeText()
+                    end)
+                end
+            end
+
+            speedBar.setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener{
+                onProgressChanged = function(seekBar, progress, fromUser)
+                    currentSpeed = 0.5 + (progress * 0.1)
+                    speedLabel.setText(string.format("Speed: %.1fx", currentSpeed))
+                    if currentPlayingPath == filePath and libMediaPlayer and isLibPlaying and Build.VERSION.SDK_INT >= 23 then
+                        pcall(function()
+                            local p = PlaybackParams()
+                            p.setSpeed(currentSpeed)
+                            libMediaPlayer.setPlaybackParams(p)
+                        end)
+                    end
+                end,
+                onStartTrackingTouch = function(seekBar) end,
+                onStopTrackingTouch = function(seekBar) end
+            })
+
+            btnShare.onClick = function() shareAudioFile(filePath) end
+
+            btnRename.onClick = function()
+                local editNewName = EditText(context)
+                local baseOld = fileName:gsub("%.wav$", "")
+                editNewName.setText(baseOld)
+                local builder = AlertDialog.Builder(context)
+                builder.setTitle("Rename Audio")
+                builder.setView(editNewName)
+                builder.setPositiveButton("SAVE", DialogInterface.OnClickListener{
+                    onClick = function(dialog, which)
+                        local newBase = tostring(editNewName.getText() or ""):match("^%s*(.-)%s*$")
+                        newBase = newBase:gsub("[\\/:*?\"<>|]", "_")
+                        if newBase == "" then
+                            showToast("Invalid file name")
+                            return
+                        end
+                        local newFile = File(getLibraryDir().getPath() .. "/" .. newBase .. ".wav")
+                        if newFile.exists() then
+                            showToast("A file with this name already exists")
+                            return
+                        end
+                        local oldMetaFile = File(getResumeMetaPath(filePath))
+                        if currentFile.renameTo(newFile) then
+                            if oldMetaFile.exists() then
+                                oldMetaFile.renameTo(File(getResumeMetaPath(newFile.getPath())))
+                            end
+                            currentFile = newFile
+                            filePath = newFile.getPath()
+                            fileName = newFile.getName()
+                            resumeMeta = loadResumeMetaFromDisk(filePath)
+                            baseInfo, totalSec, isCorrupt = buildLibBaseInfo(newFile, resumeMeta)
+                            infoTxt.setText(baseInfo .. " | 00:00 / " .. formatMMSS(totalSec))
+                            showToast("Renamed to " .. fileName)
+                        else
+                            showToast("Failed to rename file")
+                        end
+                    end
+                })
+                builder.setNegativeButton("CANCEL", nil)
+                builder.show()
+            end
+
+            btnDelete.onClick = function()
+                local builder = AlertDialog.Builder(context)
+                builder.setTitle("Confirm Delete")
+                builder.setMessage("Are you sure you want to delete this audio?")
+                builder.setPositiveButton("YES", DialogInterface.OnClickListener{
+                    onClick = function(dialog, which)
+                        pcall(function()
+                            if currentPlayingPath == filePath and libMediaPlayer then
+                                stopLibTimer()
+                                libMediaPlayer.stop()
+                                libMediaPlayer.release()
+                                libMediaPlayer = nil
+                                isLibPlaying = false
+                                currentPlayingPath = nil
+                            end
+                            local deleted = currentFile.delete()
+                            deleteResumeMetaFromDisk(filePath)
+                            if deleted or not currentFile.exists() then
+                                mainLayout.removeView(card)
+                                showToast("Deleted " .. fileName)
+                            else
+                                showToast("Error: Could not delete " .. fileName)
+                            end
+                        end)
+                    end
+                })
+                builder.setNegativeButton("NO", DialogInterface.OnClickListener{
+                    onClick = function(dialog, which) dialog.dismiss() end
+                })
+                builder.show()
+            end
+
+            btnDownload.onClick = function()
+                local okSave, msg = saveFileToDownloads(filePath, fileName)
+                if okSave then
+                    showToast("Saved to Downloads: " .. fileName)
+                else
+                    showToast("Download failed: " .. tostring(msg))
+                end
+            end
+
+            mainLayout.addView(card)
+        end
+    end
+
+    renderLibraryItems("")
+
+    searchInput.addTextChangedListener({
+        afterTextChanged = function(editable)
+            renderLibraryItems(editable.toString())
+        end
+    })
+
+    libDialog.setOnDismissListener(DialogInterface.OnDismissListener{
+        onDismiss = function()
+            stopLibTimer()
+            if libMediaPlayer then
+                pcall(function() libMediaPlayer.stop() libMediaPlayer.release() end)
+                libMediaPlayer = nil
+                isLibPlaying = false
+                currentPlayingPath = nil
+            end
+        end
+    })
+    libDialog.show()
+end
+
+function showMoreOptions()
+    local views = {}
+    local layout = {
+        LinearLayout, orientation="vertical", padding="20dp", layout_width="fill", layout_height="wrap",
+        {Button, id="btnLibrary", text="Audio Library", layout_width="fill", backgroundColor="#4CAF50", textColor="#FFFFFF", layout_marginBottom="10dp"},
+        {Button, id="btnReport", text="Report Issue (Error Log)", layout_width="fill", backgroundColor="#E91E63", textColor="#FFFFFF", layout_marginBottom="10dp"},
+        {Button, id="btnFeedback", text="Feedback", layout_width="fill", backgroundColor="#9C27B0", textColor="#FFFFFF", layout_marginBottom="10dp"},
+        {Button, id="btnWhatsapp", text="Contact Developer", layout_width="fill", backgroundColor="#25D366", textColor="#FFFFFF", layout_marginBottom="10dp"},
+        {Button, id="btnChannel", text="WhatsApp Channel", layout_width="fill", backgroundColor="#075E54", textColor="#FFFFFF", layout_marginBottom="10dp"},
+        {Button, id="btnAbout", text="About & Support", layout_width="fill", backgroundColor="#2196F3", textColor="#FFFFFF", layout_marginBottom="15dp"},
+        {Button, id="btnClose", text="CLOSE", layout_width="fill", backgroundColor="#9E9E9E", textColor="#FFFFFF"}
+    }
+    local dlg = LuaDialog(activity) 
+    dlg.setTitle("More Options") 
+    dlg.setView(loadlayout(layout, views))
+    
+    views.btnLibrary.onClick = function() dlg.dismiss() showAudioLibrary() end
+    views.btnReport.onClick = function() dlg.dismiss() openReportIssueDialog() end
+    views.btnFeedback.onClick = function() openFeedbackDialog() end
+    
+    views.btnWhatsapp.onClick = function()
+        pcall(function()
+            local intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/923041011727"))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+            dlg.dismiss()
+        end)
+    end
+    
+    views.btnChannel.onClick = function()
+        pcall(function()
+            local intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://whatsapp.com/channel/0029Vb5y8QCEwEk1OkHev10x"))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+            dlg.dismiss()
+        end)
+    end
+    
+    views.btnAbout.onClick = function() showToast("Google Gemini Text to Speech\nDeveloper: Jahbaz Hijbani") end
+    views.btnClose.onClick = function() dlg.dismiss() end
+    
+    dlg.show()
+end
+
+function showApiSettings()
+    local views = {}
+    local layout = { ScrollView, layout_width="fill", layout_height="fill", { LinearLayout, orientation="vertical", padding="15dp", layout_width="fill", layout_height="wrap", { TextView, text="10 API KEYS SETUP", textSize=16, textColor="#2196F3", gravity="center", paddingBottom="10dp", typeface=Typeface.DEFAULT_BOLD } } }
+    local keysLayout = layout[2]
+    
+    for i = 1, 10 do
+        table.insert(keysLayout, {TextView, text="API Key " .. i .. ":", textSize=11, paddingBottom="2dp", paddingTop="3dp"})
+        table.insert(keysLayout, {
+            LinearLayout, orientation="horizontal", layout_width="fill", layout_marginBottom="2dp",
+            {EditText, id="apiKey"..i, text=apiKeys[i], hint="Enter Key "..i, layout_weight="1", backgroundColor="#F5F5F5", padding="8dp", textSize=12},
+            {Button, id="testBtn"..i, text="TEST", backgroundColor="#FF9800", textColor="#FFFFFF", padding="8dp", textSize=11, layout_marginLeft="5dp"}
+        })
+    end
+    table.insert(keysLayout, { LinearLayout, orientation="horizontal", layout_width="fill", layout_marginTop="10dp", {Button, id="saveBtn", text="SAVE ALL", layout_weight="1", backgroundColor="#4CAF50", textColor="#FFFFFF", padding="10dp"}, {Button, id="closeBtn", text="CLOSE", layout_weight="1", backgroundColor="#9E9E9E", textColor="#FFFFFF", padding="10dp", layout_marginLeft="10dp"} })
+    
+    local dlg = LuaDialog(activity) 
+    dlg.setTitle("API Configuration") 
+    dlg.setView(loadlayout(layout, views))
+    
+    for i = 1, 10 do
+        views["testBtn"..i].onClick = function()
+            local key = views["apiKey"..i].getText().toString():match("^%s*(.-)%s*$")
+            if key == "" then showToast("Please enter API key "..i.." first") return end
+            if not isNetworkAvailable() then showToast("No internet connection") return end
+            
+            local testUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts?key=" .. URLEncoder.encode(key, "UTF-8")
+            
+            local pd = ProgressDialog(context)
+            pd.setMessage("Testing Key " .. i .. "...")
+            pd.setCancelable(false)
+            pd.show()
+            
+            Http.get(testUrl, function(code, content)
+                runOnUi(function()
+                    pcall(function() pd.dismiss() end)
+                    local numCode = tonumber(code) or -1
+                    if numCode == 200 then
+                        showSuccessDialog(nil, "Key " .. i .. " is Valid! Ready for Gemini TTS.")
+                    elseif numCode == 429 then
+                        showErrorDialog("Key " .. i .. " is valid, but Rate Limit/Quota reached (429).")
+                    elseif numCode == 400 or numCode == 401 or numCode == 403 then
+                        local reason = "Invalid or unauthorized API key"
+                        local okErr, errObj = pcall(cjson.decode, content)
+                        if okErr and errObj and errObj.error and errObj.error.message then
+                            reason = sanitizeErrorText(errObj.error.message)
+                        end
+                        showErrorDialog("Key " .. i .. " Failed (Code " .. tostring(numCode) .. "): " .. reason)
+                    else
+                        showErrorDialog("Key " .. i .. " test failed (Code: " .. tostring(numCode) .. "). Check internet connection.")
+                    end
+                end)
+            end)
+        end
+    end
+    
+    views.saveBtn.onClick = function()
+        for i = 1, 10 do
+            apiKeys[i] = views["apiKey"..i].getText().toString():match("^%s*(.-)%s*$")
+        end
+        saveSettings()
+        showToast("Keys Saved!")
+        dlg.dismiss()
+    end
+    views.closeBtn.onClick = function() dlg.dismiss() end
+    dlg.show()
+end
+
+function getActiveModeName()
+    if isBroadcastMode then return "broadcast"
+    elseif isStoryMode then return "story"
+    else return "single" end
+end
+
+function setSpinnerHelper(spinner, list, selectedItem, onChange)
+    local adapter = ArrayAdapter(context, android.R.layout.simple_spinner_item, list)
+    adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+    spinner.setAdapter(adapter)
+    for i, v in ipairs(list) do
+        if v == selectedItem then
+            spinner.setSelection(i - 1)
+            break
+        end
+    end
+    spinner.onItemSelectedListener = {
+        onItemSelected = function(p, v, pos)
+            onChange(list[pos + 1], pos + 1)
+        end
+    }
+end
+
+function updateModeVisibility(views)
+    views.singleModeLayout.setVisibility((not isStoryMode and not isBroadcastMode) and View.VISIBLE or View.GONE)
+    views.storyModeLayout.setVisibility(isStoryMode and View.VISIBLE or View.GONE)
+    views.broadcastModeLayout.setVisibility(isBroadcastMode and View.VISIBLE or View.GONE)
+    if isBroadcastMode then
+        views.modeStatusText.setText("Broadcast Studio Active (" .. broadcastSpeakerCount .. " Hosts)")
+        views.textInput.setHint("Enter topic to CREATE SCRIPT, or paste script to GENERATE AUDIO... Max " .. MAX_TOTAL_CHARS .. " chars")
+    elseif isStoryMode then
+        views.modeStatusText.setText("Story Mode Active")
+        views.textInput.setHint("Paste story to CREATE STORY or tagged story to GENERATE AUDIO... Max " .. MAX_TOTAL_CHARS .. " chars")
+    else
+        views.modeStatusText.setText("Single Voice Active")
+        views.textInput.setHint("Type text here... Max " .. MAX_TOTAL_CHARS .. " chars")
+    end
+end
+
+function updateBroadcastSpeakerRows(views)
+    for i = 1, 6 do
+        local row = views["spkRow" .. i]
+        if row then
+            row.setVisibility(i <= broadcastSpeakerCount and View.VISIBLE or View.GONE)
+        end
+    end
+    if isBroadcastMode then
+        views.modeStatusText.setText("Broadcast Studio Active (" .. broadcastSpeakerCount .. " Hosts)")
+    end
+end
+
+function showMain()
+    loadSettings()
+    initMainMediaPlayer()
+    local views = {}
+    mainViewsRef = views
+    local isUpdatingSwitches = false
+
+    local scrollLayout = {
+        ScrollView, layout_width="fill", layout_height="fill",
+        {
+            LinearLayout, orientation="vertical", padding="15dp", layout_width="fill", layout_height="wrap",
+            {TextView, text="Google Gemini Text to Speech", textSize=20, textColor="#1B5E20", gravity="center", paddingBottom="4dp", typeface=Typeface.DEFAULT_BOLD},
+            {TextView, id="modeStatusText", text="", textSize=14, textColor="#2196F3", gravity="center", paddingBottom="6dp", typeface=Typeface.DEFAULT_BOLD},
+            {TextView, text="Developer: Jahbaz Hijbani", textSize=12, textColor="#999999", gravity="center", paddingBottom="10dp"},
+            
+            {Button, id="optBtn", text="More Options", layout_width="fill", backgroundColor="#607D8B", textColor="#FFFFFF", padding="10dp", layout_marginBottom="10dp"},
+            
+            {Switch, id="storyModeSwitch", text=" Story Mode (Multi-Voice) ", checked=isStoryMode, textColor="#D32F2F", textSize=15, layout_marginBottom="6dp", typeface=Typeface.DEFAULT_BOLD},
+            {Switch, id="broadcastModeSwitch", text=" Broadcast Mode (2-6 Hosts) ", checked=isBroadcastMode, textColor="#1565C0", textSize=15, layout_marginBottom="8dp", typeface=Typeface.DEFAULT_BOLD},
+            
+            {EditText, id="textInput", hint="Type text here... Max " .. MAX_TOTAL_CHARS .. " chars", layout_width="fill", layout_height="150dp", backgroundColor="#F5F5F5", padding="10dp", gravity=Gravity.TOP, textSize=13, layout_marginBottom="4dp"},
+            {LinearLayout, orientation="horizontal", layout_width="fill", gravity="center_vertical", layout_marginBottom="8dp",
+                {Button, id="clearTextBtn", text="CLEAR TEXT", backgroundColor="#757575", textColor="#FFFFFF", padding="6dp", textSize=10},
+                {TextView, id="charCountText", text="Characters: 0 / " .. MAX_TOTAL_CHARS, layout_weight="1", textSize=11, textColor="#666666", gravity="right"}
+            },
+            
+            {LinearLayout, id="singleModeLayout", orientation="vertical", layout_width="fill", visibility=View.VISIBLE, layout_marginBottom="8dp",
+                {LinearLayout, orientation="horizontal", layout_width="fill", layout_marginBottom="8dp",
+                    {LinearLayout, orientation="vertical", layout_weight="1", layout_marginRight="4dp",
+                        {TextView, text="Select Voice:", textSize=12, paddingBottom="2dp"},
+                        {Spinner, id="voiceSpin", layout_width="fill", backgroundColor="#F5F5F5"},
+                    },
+                    {LinearLayout, orientation="vertical", layout_weight="1", layout_marginLeft="4dp",
+                        {TextView, text="Select Model:", textSize=12, paddingBottom="2dp"},
+                        {Spinner, id="modelSpinSingle", layout_width="fill", backgroundColor="#F5F5F5"},
+                    }
+                },
+                {LinearLayout, orientation="vertical", layout_width="fill",
+                    {TextView, text="Select Tone:", textSize=12, textColor="#1B5E20", paddingBottom="2dp", typeface=Typeface.DEFAULT_BOLD},
+                    {Spinner, id="toneSpin", layout_width="fill", backgroundColor="#F5F5F5"},
+                }
+            },
+            
+            {LinearLayout, id="storyModeLayout", orientation="vertical", layout_width="fill", visibility=View.GONE, layout_marginBottom="8dp",
+                {LinearLayout, orientation="horizontal", layout_width="fill", layout_marginBottom="8dp",
+                    {LinearLayout, orientation="vertical", layout_weight="1", layout_marginRight="4dp",
+                        {TextView, text="Narrator Voice:", textSize=12, textColor="#1B5E20", paddingBottom="2dp"},
+                        {Spinner, id="narratorSpin", layout_width="fill", backgroundColor="#E8F5E9"},
+                    },
+                    {LinearLayout, orientation="vertical", layout_weight="1", layout_marginLeft="4dp",
+                        {TextView, text="Model:", textSize=12, paddingBottom="2dp"},
+                        {Spinner, id="modelSpinStory", layout_width="fill", backgroundColor="#F5F5F5"},
+                    }
+                },
+                {Button, id="createStoryBtn", text="CREATE STORY", layout_width="fill", backgroundColor="#00897B", textColor="#FFFFFF", padding="10dp", textSize=14, typeface=Typeface.DEFAULT_BOLD}
+            },
+
+            {LinearLayout, id="broadcastModeLayout", orientation="vertical", layout_width="fill", visibility=View.GONE, layout_marginBottom="8dp",
+                {LinearLayout, orientation="horizontal", layout_width="fill", layout_marginBottom="6dp",
+                    {LinearLayout, orientation="vertical", layout_weight="1", layout_marginRight="4dp",
+                        {TextView, text="Speakers (2-6):", textSize=12, textColor="#1565C0", paddingBottom="2dp"},
+                        {Spinner, id="speakerCountSpin", layout_width="fill", backgroundColor="#E3F2FD"},
+                    },
+                    {LinearLayout, orientation="vertical", layout_weight="1", layout_marginLeft="4dp",
+                        {TextView, text="Model:", textSize=12, paddingBottom="2dp"},
+                        {Spinner, id="modelSpinBroadcast", layout_width="fill", backgroundColor="#F5F5F5"},
+                    }
+                },
+                {LinearLayout, id="spkRow1", orientation="vertical", layout_width="fill", layout_marginBottom="4dp",
+                    {TextView, text="Speaker 1 Voice:", textSize=11, paddingBottom="2dp"},
+                    {Spinner, id="spkSpin1", layout_width="fill", backgroundColor="#F5F5F5"}
+                },
+                {LinearLayout, id="spkRow2", orientation="vertical", layout_width="fill", layout_marginBottom="4dp",
+                    {TextView, text="Speaker 2 Voice:", textSize=11, paddingBottom="2dp"},
+                    {Spinner, id="spkSpin2", layout_width="fill", backgroundColor="#F5F5F5"}
+                },
+                {LinearLayout, id="spkRow3", orientation="vertical", layout_width="fill", layout_marginBottom="4dp", visibility=View.GONE,
+                    {TextView, text="Speaker 3 Voice:", textSize=11, paddingBottom="2dp"},
+                    {Spinner, id="spkSpin3", layout_width="fill", backgroundColor="#F5F5F5"}
+                },
+                {LinearLayout, id="spkRow4", orientation="vertical", layout_width="fill", layout_marginBottom="4dp", visibility=View.GONE,
+                    {TextView, text="Speaker 4 Voice:", textSize=11, paddingBottom="2dp"},
+                    {Spinner, id="spkSpin4", layout_width="fill", backgroundColor="#F5F5F5"}
+                },
+                {LinearLayout, id="spkRow5", orientation="vertical", layout_width="fill", layout_marginBottom="4dp", visibility=View.GONE,
+                    {TextView, text="Speaker 5 Voice:", textSize=11, paddingBottom="2dp"},
+                    {Spinner, id="spkSpin5", layout_width="fill", backgroundColor="#F5F5F5"}
+                },
+                {LinearLayout, id="spkRow6", orientation="vertical", layout_width="fill", layout_marginBottom="6dp", visibility=View.GONE,
+                    {TextView, text="Speaker 6 Voice:", textSize=11, paddingBottom="2dp"},
+                    {Spinner, id="spkSpin6", layout_width="fill", backgroundColor="#F5F5F5"}
+                },
+                {TextView, text="Select Broadcast Mood:", textSize=12, textColor="#1565C0", paddingBottom="2dp", typeface=Typeface.DEFAULT_BOLD},
+                {Spinner, id="broadcastMoodSpin", layout_width="fill", backgroundColor="#E3F2FD", layout_marginBottom="6dp"},
+                {TextView, text="Select Script Duration:", textSize=12, paddingBottom="2dp"},
+                {Spinner, id="durationSpin", layout_width="fill", backgroundColor="#F5F5F5", layout_marginBottom="6dp"},
+                {EditText, id="customMinInput", hint="Enter Custom Minutes (1-60)", text=customMinutesStr, inputType=InputType.TYPE_CLASS_NUMBER, layout_width="fill", backgroundColor="#FFF8E1", padding="8dp", layout_marginBottom="6dp", visibility=View.GONE},
+                {Button, id="createScriptBtn", text="CREATE SCRIPT", layout_width="fill", backgroundColor="#00897B", textColor="#FFFFFF", padding="10dp", textSize=14, typeface=Typeface.DEFAULT_BOLD}
+            },
+
+            {EditText, id="fileNameInput", hint="File name (Optional)", text=userFileName, layout_width="fill", backgroundColor="#F5F5F5", padding="8dp", layout_marginBottom="8dp"},
+            {TextView, id="statusText", text="", textSize=11, textColor="#FF5722", gravity="center", paddingBottom="8dp"},
+            
+            {Button, id="generateBtn", text="GENERATE AUDIO", layout_width="fill", backgroundColor="#2196F3", textColor="#FFFFFF", padding="12dp", textSize=15, typeface=Typeface.DEFAULT_BOLD, layout_marginBottom="6dp"},
+            {Button, id="resumeBtn", text="RESUME AUDIO", layout_width="fill", backgroundColor="#FF9800", textColor="#FFFFFF", padding="10dp", textSize=14, typeface=Typeface.DEFAULT_BOLD, visibility=View.GONE, layout_marginBottom="8dp"},
+            
+            {LinearLayout, id="resultLayout", orientation="horizontal", layout_width="fill", visibility=View.GONE, layout_marginBottom="8dp",
+                {Button, id="playBtn", text="PLAY", layout_weight="1", backgroundColor="#4CAF50", textColor="#FFFFFF", padding="10dp", textSize=11},
+                {Button, id="shareBtn", text="SHARE", layout_weight="1", backgroundColor="#009688", textColor="#FFFFFF", padding="10dp", textSize=11, layout_marginLeft="4dp"},
+                {Button, id="downloadBtn", text="DOWNLOAD", layout_weight="1", backgroundColor="#FF9800", textColor="#FFFFFF", padding="10dp", textSize=11, layout_marginLeft="4dp"}
+            },
+            
+            {LinearLayout, orientation="horizontal", layout_width="fill", layout_marginTop="4dp",
+                {Button, id="apiBtn", text="API KEYS", layout_weight="1", backgroundColor="#9C27B0", textColor="#FFFFFF", padding="10dp", textSize=11},
+                {Button, id="stopBtn", text="STOP", layout_weight="1", backgroundColor="#F44336", textColor="#FFFFFF", padding="10dp", textSize=11, enabled=false, layout_marginLeft="4dp"}
+            }
+        }
+    }
+
+    activity.setTitle("Google Gemini Text to Speech")
+    activity.setContentView(loadlayout(scrollLayout, views))
+
+    updateModeVisibility(views)
+    updateBroadcastSpeakerRows(views)
+    views.customMinInput.setVisibility(selectedDuration == "Custom Minutes" and View.VISIBLE or View.GONE)
+
+    resumeState = findLatestResumeState()
+    if resumeState then
+        views.resumeBtn.setVisibility(View.VISIBLE)
+        views.resumeBtn.setText("RESUME AUDIO (" .. tostring(resumeState.nextIndex) .. "/" .. tostring(resumeState.totalChunks) .. ")")
+    end
+
+    pcall(function()
+        activity.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+    end)
+
+    views.storyModeSwitch.setOnCheckedChangeListener({
+        onCheckedChanged = function(view, isChecked)
+            if isUpdatingSwitches then return end
+            isUpdatingSwitches = true
+            isStoryMode = isChecked
+            if isChecked then
+                isBroadcastMode = false
+                views.broadcastModeSwitch.setChecked(false)
+            end
+            isUpdatingSwitches = false
+            saveSettings()
+            updateModeVisibility(views)
+            showToast(isStoryMode and "Story Mode Active" or "Single Voice Active")
+        end
+    })
+
+    views.broadcastModeSwitch.setOnCheckedChangeListener({
+        onCheckedChanged = function(view, isChecked)
+            if isUpdatingSwitches then return end
+            isUpdatingSwitches = true
+            isBroadcastMode = isChecked
+            if isChecked then
+                isStoryMode = false
+                views.storyModeSwitch.setChecked(false)
+            end
+            isUpdatingSwitches = false
+            saveSettings()
+            updateModeVisibility(views)
+            showToast(isBroadcastMode and "Broadcast Mode Active" or "Single Voice Active")
+        end
+    })
+
+    views.clearTextBtn.onClick = function()
+        views.textInput.setText("")
+        userText = ""
+        showToast("Text cleared")
+    end
+
+    views.textInput.addTextChangedListener({
+        afterTextChanged = function(editable)
+            userText = editable.toString()
+            local count = editable.length()
+            views.charCountText.setText("Characters: " .. count .. " / " .. MAX_TOTAL_CHARS)
+            views.charCountText.setTextColor(count > MAX_TOTAL_CHARS and 0xFFF44336 or 0xFF666666)
+        end
+    })
+
+    views.fileNameInput.addTextChangedListener({
+        afterTextChanged = function(e)
+            userFileName = e.toString():match("^%s*(.-)%s*$")
+            saveSettings()
+        end
+    })
+
+    views.customMinInput.addTextChangedListener({
+        afterTextChanged = function(e)
+            customMinutesStr = e.toString():match("^%s*(.-)%s*$")
+            saveSettings()
+        end
+    })
+
+    setSpinnerHelper(views.voiceSpin, ALL_VOICES, selectedVoice, function(val) selectedVoice = val saveSettings() end)
+    setSpinnerHelper(views.toneSpin, ALL_TONES, selectedTone, function(val) selectedTone = val saveSettings() end)
+    setSpinnerHelper(views.narratorSpin, NARRATOR_VOICES, selectedNarrator, function(val) selectedNarrator = val saveSettings() end)
+    setSpinnerHelper(views.modelSpinSingle, TTS_MODELS, selectedModel, function(val) selectedModel = val saveSettings() end)
+    setSpinnerHelper(views.modelSpinStory, TTS_MODELS, selectedModel, function(val) selectedModel = val saveSettings() end)
+    setSpinnerHelper(views.modelSpinBroadcast, TTS_MODELS, selectedModel, function(val) selectedModel = val saveSettings() end)
+
+    setSpinnerHelper(views.speakerCountSpin, SPEAKER_COUNTS, broadcastSpeakerCount .. " Speakers", function(val, pos)
+        broadcastSpeakerCount = pos + 1
+        saveSettings()
+        updateBroadcastSpeakerRows(views)
+    end)
+
+    for i = 1, 6 do
+        setSpinnerHelper(views["spkSpin" .. i], ALL_VOICES, broadcastVoices[i], function(val)
+            broadcastVoices[i] = val
+            saveSettings()
+        end)
+    end
+
+    setSpinnerHelper(views.broadcastMoodSpin, BROADCAST_MOODS, selectedBroadcastMood, function(val)
+        selectedBroadcastMood = val
+        saveSettings()
+    end)
+
+    setSpinnerHelper(views.durationSpin, SCRIPT_DURATIONS, selectedDuration, function(val)
+        selectedDuration = val
+        views.customMinInput.setVisibility(val == "Custom Minutes" and View.VISIBLE or View.GONE)
+        saveSettings()
+    end)
+
+    views.createScriptBtn.onClick = function() runCreateBroadcastScript(views) end
+    views.createStoryBtn.onClick = function() runCreateStoryScript(views) end
+
+    views.playBtn.onClick = function()
+        if not generatedAudioPath then showToast("Generate audio first") return end
+        if mainMediaPlayer == nil then
+            initMainMediaPlayer()
+            pcall(function()
+                mainMediaPlayer.setDataSource(generatedAudioPath)
+                mainMediaPlayer.prepare()
+                mainMediaPlayer.setOnCompletionListener(MediaPlayer.OnCompletionListener{
+                    onCompletion = function(mp)
+                        isMainPlaying = false
+                        runOnUi(function() views.playBtn.setText("PLAY") end)
+                    end
+                })
+            end)
+        end
+        toggleMainPlayPause(views.playBtn)
+    end
+
+    views.shareBtn.onClick = function()
+        if not generatedAudioPath then showToast("No audio to share") return end
+        shareAudioFile(generatedAudioPath)
+    end
+
+    views.downloadBtn.onClick = function()
+        if not generatedAudioPath then showToast("No audio found") return end
+        local fObj = File(generatedAudioPath)
+        local outName = fObj.exists() and fObj.getName() or ((userFileName ~= "" and userFileName or getDefaultFileName(getActiveModeName())) .. ".wav")
+        local okSave, msg = saveFileToDownloads(generatedAudioPath, outName)
+        if okSave then
+            showToast("Downloaded to Mobile Storage: " .. outName)
+        else
+            showToast("Failed to Download: " .. tostring(msg))
+        end
+    end
+
+    views.generateBtn.onClick = function()
+        local currentText = views.textInput.getText().toString()
+        if currentText:match("^%s*$") then
+            showToast("Please enter text first!")
+            return
+        end
+        if not getWorkingApiKey() then
+            showToast("Please configure API Key first!")
+            showApiSettings()
+            return
+        end
+        if String(currentText).length() > MAX_TOTAL_CHARS then
+            showToast("Text exceeds " .. MAX_TOTAL_CHARS .. " characters limit!")
+            return
+        end
+        if not isNetworkAvailable() then
+            showToast("No internet connection!")
+            showErrorDialog("Please turn on Wi-Fi or Mobile Data to generate audio.")
+            return
+        end
+
+        userText = currentText
+        if mainMediaPlayer ~= nil then
+            pcall(function() if isMainPlaying then mainMediaPlayer.stop() end end)
+            isMainPlaying = false
+            pcall(function() mainMediaPlayer.release() end)
+            mainMediaPlayer = nil
+        end
+
+        views.playBtn.setEnabled(false)
+        views.playBtn.setText("PLAY")
+        views.resultLayout.setVisibility(View.GONE)
+        views.resumeBtn.setVisibility(View.GONE)
+        views.generateBtn.setEnabled(false)
+        views.generateBtn.setText("GENERATING AUDIO (0%)...")
+        views.generateBtn.setBackgroundColor(Color.parseColor("#9E9E9E"))
+        views.stopBtn.setEnabled(true)
+
+        generateFullAudio(userText, getActiveModeName(), nil, views)
+    end
+
+    views.resumeBtn.onClick = function()
+        if not resumeState then
+            resumeState = findLatestResumeState()
+        end
+        if not resumeState then showToast("Nothing to resume") return end
+        startResumeFromLibrary(resumeState, views)
+    end
+
+    views.stopBtn.onClick = function()
+        if cancellationRequested then return end
+        cancellationRequested = true
+        currentGenerationId = currentGenerationId + 1
+        pcall(function()
+            if activeHttpRequest and activeHttpRequest.cancel then
+                activeHttpRequest.cancel(true)
+            end
+        end)
+        views.statusText.setText("Stopping... saving progress...")
+        showToast("Stopping...")
+        views.generateBtn.setEnabled(true)
+        views.generateBtn.setText("GENERATE AUDIO")
+        views.generateBtn.setBackgroundColor(Color.parseColor("#2196F3"))
+        views.createScriptBtn.setEnabled(true)
+        views.createScriptBtn.setText("CREATE SCRIPT")
+        views.createStoryBtn.setEnabled(true)
+        views.createStoryBtn.setText("CREATE STORY")
+        views.stopBtn.setEnabled(false)
+    end
+
+    views.apiBtn.onClick = function() showApiSettings() end
+    views.optBtn.onClick = function() showMoreOptions() end
+end
+
+function onDestroy()
+    cancellationRequested = true
+    currentGenerationId = currentGenerationId + 1
+    setKeepAwake(false)
+    stopLibTimer()
+    pcall(function()
+        if mainMediaPlayer then
+            if isMainPlaying then mainMediaPlayer.stop() end
+            mainMediaPlayer.release()
+            mainMediaPlayer = nil
+        end
+    end)
+    pcall(function()
+        if libMediaPlayer then
+            libMediaPlayer.stop()
+            libMediaPlayer.release()
+            libMediaPlayer = nil
+        end
+    end)
+end
+
+showMain()
