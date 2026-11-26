@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  APP_VERSION_NAME: '1.7'
+  APP_VERSION_NAME: '1.8'
 
 jobs:
   build:
@@ -210,7 +210,7 @@ jobs:
           }
 
           def appVerCode = Integer.parseInt(System.getenv("GITHUB_RUN_NUMBER") ?: "1")
-          def appVerName = System.getenv("APP_VERSION_NAME") ?: "1.7"
+          def appVerName = System.getenv("APP_VERSION_NAME") ?: "1.8"
           def ksStorePass = System.getenv("KEYSTORE_PASSWORD") ?: "MJAud1oReleaseKey2026"
           def ksKeyAlias = System.getenv("KEY_ALIAS") ?: "mj_audio_key"
           def ksKeyPass = System.getenv("KEY_PASSWORD") ?: "MJAud1oReleaseKey2026"
@@ -279,20 +279,12 @@ jobs:
             <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
             <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
             <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
-            <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
-            <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
             <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
             <uses-permission android:name="android.permission.WAKE_LOCK" />
             <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
             <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
             <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-            <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-            <uses-permission android:name="android.permission.VIBRATE" />
-            <uses-permission android:name="android.permission.BLUETOOTH" />
-            <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
             <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
-
-            <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
 
             <queries>
               <package android:name="com.whatsapp" />
@@ -1066,7 +1058,6 @@ jobs:
                           lastEchoDelay = echoDelay;
                           lastEchoVol = echoVol;
 
-                          // Only call setPlaybackParams when speed or pitch actually differs
                           try {
                               PlaybackParams curParams = mediaPlayer.getPlaybackParams();
                               float curSpd = curParams.getSpeed();
@@ -1138,7 +1129,6 @@ jobs:
                       seekLockUntil = System.currentTimeMillis() + 2500L;
                       needsApplyFxAfterSeek = true;
 
-                      // Seek before start AND re-seek in STARTED state so audio NEVER jumps back
                       seekUniversal(mediaPlayer, target);
                       mediaPlayer.start();
                       isPlaying = true;
@@ -1288,7 +1278,6 @@ jobs:
                           notifyUi();
                       } else {
                           if (isPlayerPrepared) {
-                              // Always resume the already-prepared track at pausedSeekPos
                               startWithPendingSeek();
                               AudioItem item = getCurrentItem();
                               if (item != null) {
@@ -1483,16 +1472,19 @@ jobs:
                           ctx, 0, openIntent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
                   PendingIntent piPrev = createActionPendingIntent(ctx, 1, ACTION_PREV);
+                  PendingIntent piRewind = createActionPendingIntent(ctx, 5, ACTION_REWIND);
                   PendingIntent piPlay = createActionPendingIntent(ctx, 2, ACTION_PLAY);
+                  PendingIntent piForward = createActionPendingIntent(ctx, 6, ACTION_FORWARD);
                   PendingIntent piNext = createActionPendingIntent(ctx, 3, ACTION_NEXT);
                   PendingIntent piClose = createActionPendingIntent(ctx, 4, ACTION_CLOSE);
-                  PendingIntent piForward = createActionPendingIntent(ctx, 6, ACTION_FORWARD);
 
                   String titleToDisplay = (item != null)
                           ? getTagsPrefs(ctx).getString(item.path + "_title", item.name)
                           : getPrefs(ctx).getString("lastPlayingName", "MJ Audio Player");
                   if (titleToDisplay == null || titleToDisplay.isEmpty()) titleToDisplay = "MJ Audio Player";
 
+                  // Exact 5 notification actions: Prev, Rewind, Play/Pause, Forward, Next
+                  // Swiping away when paused triggers piClose via setDeleteIntent
                   builder.setContentTitle(titleToDisplay)
                           .setContentText("MJ Audio Player")
                           .setSmallIcon(R.drawable.ic_stat_music)
@@ -1501,15 +1493,15 @@ jobs:
                           .setOngoing(isPlay)
                           .setVisibility(Notification.VISIBILITY_PUBLIC)
                           .addAction(android.R.drawable.ic_media_previous, "Prev", piPrev)
+                          .addAction(android.R.drawable.ic_media_rew, "Rewind", piRewind)
                           .addAction(isPlay ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
                                   isPlay ? "Pause" : "Play", piPlay)
-                          .addAction(android.R.drawable.ic_media_next, "Next", piNext)
                           .addAction(android.R.drawable.ic_media_ff, "Forward", piForward)
-                          .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Close", piClose);
+                          .addAction(android.R.drawable.ic_media_next, "Next", piNext);
 
                   try {
                       Notification.MediaStyle style = new Notification.MediaStyle();
-                      style.setShowActionsInCompactView(0, 1, 2);
+                      style.setShowActionsInCompactView(1, 2, 3);
                       if (Build.VERSION.SDK_INT >= 21 && mediaSession != null) {
                           style.setMediaSession(mediaSession.getSessionToken());
 
@@ -1543,8 +1535,9 @@ jobs:
                                           | PlaybackState.ACTION_SEEK_TO
                                           | PlaybackState.ACTION_STOP
                           );
+                          // Android 13-16 displays Prev + Play/Pause + Next + these 2 custom slots (Rewind & Forward)
                           stateBuilder.addCustomAction(new PlaybackState.CustomAction.Builder(
-                                  CUSTOM_ACTION_CLOSE, "Close", android.R.drawable.ic_menu_close_clear_cancel).build());
+                                  CUSTOM_ACTION_REWIND, "Rewind", android.R.drawable.ic_media_rew).build());
                           stateBuilder.addCustomAction(new PlaybackState.CustomAction.Builder(
                                   CUSTOM_ACTION_FORWARD, "Forward", android.R.drawable.ic_media_ff).build());
                           mediaSession.setPlaybackState(stateBuilder.build());
@@ -2572,21 +2565,24 @@ jobs:
                   devView.setTextSize(12);
                   devView.setTextColor(colorTextSub);
                   devView.setGravity(Gravity.CENTER);
-                  devView.setPadding(0, dp(2), 0, dp(10));
+                  devView.setPadding(0, dp(2), 0, dp(8));
                   topBarCard.addView(devView);
 
-                  // Top Button Row: Scrollable tabs (Search, All Files, Sort, Favorites, View) + Settings pinned at far right corner
-                  LinearLayout topLineContainer = new LinearLayout(ctx);
-                  topLineContainer.setOrientation(LinearLayout.HORIZONTAL);
-                  topLineContainer.setGravity(Gravity.CENTER_VERTICAL);
-                  topLineContainer.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
-                  topLineContainer.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
+                  // Settings Button placed right below Developer Name and above the Search button row
+                  Button btnSettingsTop = new Button(ctx);
+                  btnSettingsTop.setText("Settings");
+                  stylePillButton(btnSettingsTop, false, colorPrimary);
+                  btnSettingsTop.setPadding(dp(24), dp(7), dp(24), dp(7));
+                  LinearLayout.LayoutParams settingsTopLp = new LinearLayout.LayoutParams(-2, -2);
+                  settingsTopLp.gravity = Gravity.CENTER_HORIZONTAL;
+                  settingsTopLp.bottomMargin = dp(8);
+                  btnSettingsTop.setLayoutParams(settingsTopLp);
+                  topBarCard.addView(btnSettingsTop);
 
+                  // Search, All Files, Sort, Favorites, View Mode Row
                   HorizontalScrollView topButtonScroll = new HorizontalScrollView(ctx);
                   topButtonScroll.setHorizontalScrollBarEnabled(false);
-                  LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(0, -2, 1f);
-                  scrollLp.rightMargin = dp(6);
-                  topButtonScroll.setLayoutParams(scrollLp);
+                  topButtonScroll.setLayoutParams(new LinearLayout.LayoutParams(-1, -2));
 
                   LinearLayout topButtonRow = new LinearLayout(ctx);
                   topButtonRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -2624,16 +2620,7 @@ jobs:
                   topButtonRow.addView(btnViewMode);
 
                   topButtonScroll.addView(topButtonRow);
-                  topLineContainer.addView(topButtonScroll);
-
-                  // Settings Button pinned in top-right corner
-                  Button btnSettingsTop = new Button(ctx);
-                  btnSettingsTop.setText("Settings");
-                  stylePillButton(btnSettingsTop, false, colorPrimary);
-                  btnSettingsTop.setLayoutParams(new LinearLayout.LayoutParams(-2, -2));
-                  topLineContainer.addView(btnSettingsTop);
-
-                  topBarCard.addView(topLineContainer);
+                  topBarCard.addView(topButtonScroll);
 
                   LinearLayout folderRowLayout = new LinearLayout(ctx);
                   folderRowLayout.setOrientation(LinearLayout.HORIZONTAL);
@@ -2934,7 +2921,6 @@ jobs:
                           if (fromUser) {
                               draggedSeekPos = progress;
                               timeCurrent.setText(formatDuration(progress));
-                              // Non-drag changes (TalkBack/Accessibility 5% steps, key presses) never fire onStopTrackingTouch
                               if (!isUserSeeking) {
                                   MediaPlaybackService.seekToPosition(ctx, progress);
                               }
@@ -4309,7 +4295,7 @@ jobs:
 
                   final AlertDialog[] dlgRef = new AlertDialog[1];
 
-                  // ---- TOP 3 BUTTONS INSIDE SETTINGS (EXACT ORDER): Voice FX, Custom Equalizer, Speed ----
+                  // ---- TOP 3 BUTTONS INSIDE SETTINGS: Voice FX, Custom Equalizer, Speed ----
                   Button btnVoice = createDialogMenuButton("Voice FX", colorChip, colorCardPressed, colorBorder, colorTextMain);
                   btnVoice.setOnClickListener(v -> showVoiceEffectsDialog());
                   innerLayout.addView(btnVoice);
@@ -4578,11 +4564,11 @@ jobs:
           tag_name: v${{ env.APP_VERSION_NAME }}
           name: MJ Audio Player v${{ env.APP_VERSION_NAME }}
           body: |
-            - Upgraded Target SDK to Android 16 (API 36) with Min SDK 24 (Android 7+)
-            - Fixed Seek/Slider Sync in both Playing and Paused states (drag & step controls)
-            - Updated Home Screen Layout (Settings moved to top-right, Voice FX / Equalizer / Speed moved to top of Settings)
-            - Clean Bottom Bar (Go To Time + Slider + A-B Repeat row above Prev / Rewind / Play-Pause / Forward / Next)
-            - Signed with V1 + V2 + V3 + V4 Release Schemes
+            - Removed 6 unnecessary permissions for cleaner privacy & security
+            - Moved Settings button below Developer Name and above Search bar
+            - Restored Rewind button in Notification (Prev, Rewind, Play/Pause, Forward, Next)
+            - Target SDK Android 16 (API 36), Min SDK Android 7 (API 24)
+            - Full Seek/Slider Sync & V1 + V2 + V3 + V4 Release Signing
           files: |
             MJ-Audio-Player-v${{ env.APP_VERSION_NAME }}-Release.apk
             MJ-Audio-Player-v${{ env.APP_VERSION_NAME }}-Release.apk.idsig
